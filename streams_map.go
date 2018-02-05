@@ -65,10 +65,10 @@ func newStreamsMap(
 	newUniReceiveStream := func(id protocol.StreamID) receiveStreamI {
 		return newReceiveStream(id, m.sender, m.newFlowController(id), version)
 	}
-	m.outgoingBidiStreams = newOutgoingBidiStreamsMap(firstOutgoingBidiStream, newBidiStream)
+	m.outgoingBidiStreams = newOutgoingBidiStreamsMap(firstOutgoingBidiStream, newBidiStream, sender.queueControlFrame)
 	// TODO(#1150): use a reasonable stream limit
 	m.incomingBidiStreams = newIncomingBidiStreamsMap(firstIncomingBidiStream, protocol.StreamID(math.MaxUint32), newBidiStream)
-	m.outgoingUniStreams = newOutgoingUniStreamsMap(firstOutgoingUniStream, newUniSendStream)
+	m.outgoingUniStreams = newOutgoingUniStreamsMap(firstOutgoingUniStream, newUniSendStream, sender.queueControlFrame)
 	// TODO(#1150): use a reasonable stream limit
 	m.incomingUniStreams = newIncomingUniStreamsMap(firstIncomingUniStream, protocol.StreamID(math.MaxUint32), newUniReceiveStream)
 	return m

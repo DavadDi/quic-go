@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/golang/mock/gomock"
 	"github.com/lucas-clemente/quic-go/internal/flowcontrol"
 	"github.com/lucas-clemente/quic-go/internal/handshake"
 	"github.com/lucas-clemente/quic-go/internal/mocks"
@@ -60,7 +61,9 @@ var _ = Describe("Streams Map (for IETF QUIC)", func() {
 			}
 
 			BeforeEach(func() {
-				m = newStreamsMap(nil, newFlowController, perspective, versionIETFFrames).(*streamsMap)
+				sender := NewMockStreamSender(mockCtrl)
+				sender.EXPECT().queueControlFrame(gomock.Any()).AnyTimes()
+				m = newStreamsMap(sender, newFlowController, perspective, versionIETFFrames).(*streamsMap)
 			})
 
 			Context("opening", func() {
