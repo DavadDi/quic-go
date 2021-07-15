@@ -60,7 +60,7 @@ var _ = Describe("Packet Unpacker", func() {
 		opener := mocks.NewMockLongHeaderOpener(mockCtrl)
 		cs.EXPECT().GetHandshakeOpener().Return(opener, nil)
 		_, err := unpacker.Unpack(hdr, time.Now(), data)
-		Expect(errors.Is(err, &headerParseError{})).To(BeTrue())
+		Expect(err).To(BeAssignableToTypeOf(&headerParseError{}))
 		var headerErr *headerParseError
 		Expect(errors.As(err, &headerErr)).To(BeTrue())
 		Expect(err).To(MatchError("Packet too small. Expected at least 20 bytes after the header, got 19"))
@@ -77,9 +77,7 @@ var _ = Describe("Packet Unpacker", func() {
 		opener := mocks.NewMockShortHeaderOpener(mockCtrl)
 		cs.EXPECT().Get1RTTOpener().Return(opener, nil)
 		_, err := unpacker.Unpack(hdr, time.Now(), data)
-		Expect(errors.Is(err, &headerParseError{})).To(BeTrue())
-		var headerErr *headerParseError
-		Expect(errors.As(err, &headerErr)).To(BeTrue())
+		Expect(err).To(BeAssignableToTypeOf(&headerParseError{}))
 		Expect(err).To(MatchError("Packet too small. Expected at least 20 bytes after the header, got 19"))
 	})
 
@@ -186,9 +184,10 @@ var _ = Describe("Packet Unpacker", func() {
 		cs.EXPECT().GetHandshakeOpener().Return(opener, nil)
 		opener.EXPECT().DecryptHeader(gomock.Any(), gomock.Any(), gomock.Any())
 		opener.EXPECT().DecodePacketNumber(gomock.Any(), gomock.Any())
-		opener.EXPECT().Open(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, qerr.CryptoBufferExceeded)
+		unpackErr := &qerr.TransportError{ErrorCode: qerr.CryptoBufferExceeded}
+		opener.EXPECT().Open(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, unpackErr)
 		_, err := unpacker.Unpack(hdr, time.Now(), append(hdrRaw, payload...))
-		Expect(err).To(MatchError(qerr.CryptoBufferExceeded))
+		Expect(err).To(MatchError(unpackErr))
 	})
 
 	It("defends against the timing side-channel when the reserved bits are wrong, for long header packets", func() {
