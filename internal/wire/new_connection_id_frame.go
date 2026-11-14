@@ -1,12 +1,12 @@
 package wire
 
 import (
-	"bytes"
+	"errors"
 	"fmt"
 	"io"
 
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/quicvarint"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 // A NewConnectionIDFrame is a NEW_CONNECTION_ID frame
@@ -17,64 +17,64 @@ type NewConnectionIDFrame struct {
 	StatelessResetToken protocol.StatelessResetToken
 }
 
-func parseNewConnectionIDFrame(r *bytes.Reader, _ protocol.VersionNumber) (*NewConnectionIDFrame, error) {
-	if _, err := r.ReadByte(); err != nil {
-		return nil, err
-	}
-
-	seq, err := quicvarint.Read(r)
+func parseNewConnectionIDFrame(b []byte, _ protocol.Version) (*NewConnectionIDFrame, int, error) {
+	startLen := len(b)
+	seq, l, err := quicvarint.Parse(b)
 	if err != nil {
-		return nil, err
+		return nil, 0, replaceUnexpectedEOF(err)
 	}
-	ret, err := quicvarint.Read(r)
+	b = b[l:]
+	ret, l, err := quicvarint.Parse(b)
 	if err != nil {
-		return nil, err
+		return nil, 0, replaceUnexpectedEOF(err)
 	}
+	b = b[l:]
 	if ret > seq {
-		//nolint:stylecheck
-		return nil, fmt.Errorf("Retire Prior To value (%d) larger than Sequence Number (%d)", ret, seq)
+		//nolint:staticcheck // SA1021: Retire Prior To is the name of the field
+		return nil, 0, fmt.Errorf("Retire Prior To value (%d) larger than Sequence Number (%d)", ret, seq)
 	}
-	connIDLen, err := r.ReadByte()
-	if err != nil {
-		return nil, err
+	if len(b) == 0 {
+		return nil, 0, io.EOF
+	}
+	connIDLen := int(b[0])
+	b = b[1:]
+	if connIDLen == 0 {
+		return nil, 0, errors.New("invalid zero-length connection ID")
 	}
 	if connIDLen > protocol.MaxConnIDLen {
-		return nil, fmt.Errorf("invalid connection ID length: %d", connIDLen)
+		return nil, 0, protocol.ErrInvalidConnectionIDLen
 	}
-	connID, err := protocol.ReadConnectionID(r, int(connIDLen))
-	if err != nil {
-		return nil, err
+	if len(b) < connIDLen {
+		return nil, 0, io.EOF
 	}
 	frame := &NewConnectionIDFrame{
 		SequenceNumber: seq,
 		RetirePriorTo:  ret,
-		ConnectionID:   connID,
+		ConnectionID:   protocol.ParseConnectionID(b[:connIDLen]),
 	}
-	if _, err := io.ReadFull(r, frame.StatelessResetToken[:]); err != nil {
-		if err == io.ErrUnexpectedEOF {
-			return nil, io.EOF
-		}
-		return nil, err
+	b = b[connIDLen:]
+	if len(b) < len(frame.StatelessResetToken) {
+		return nil, 0, io.EOF
 	}
-
-	return frame, nil
+	copy(frame.StatelessResetToken[:], b)
+	return frame, startLen - len(b) + len(frame.StatelessResetToken), nil
 }
 
-func (f *NewConnectionIDFrame) Write(b *bytes.Buffer, _ protocol.VersionNumber) error {
-	b.WriteByte(0x18)
-	quicvarint.Write(b, f.SequenceNumber)
-	quicvarint.Write(b, f.RetirePriorTo)
+func (f *NewConnectionIDFrame) Append(b []byte, _ protocol.Version) ([]byte, error) {
+	b = append(b, byte(FrameTypeNewConnectionID))
+	b = quicvarint.Append(b, f.SequenceNumber)
+	b = quicvarint.Append(b, f.RetirePriorTo)
 	connIDLen := f.ConnectionID.Len()
 	if connIDLen > protocol.MaxConnIDLen {
-		return fmt.Errorf("invalid connection ID length: %d", connIDLen)
+		return nil, fmt.Errorf("invalid connection ID length: %d", connIDLen)
 	}
-	b.WriteByte(uint8(connIDLen))
-	b.Write(f.ConnectionID.Bytes())
-	b.Write(f.StatelessResetToken[:])
-	return nil
+	b = append(b, uint8(connIDLen))
+	b = append(b, f.ConnectionID.Bytes()...)
+	b = append(b, f.StatelessResetToken[:]...)
+	return b, nil
 }
 
 // Length of a written frame
-func (f *NewConnectionIDFrame) Length(protocol.VersionNumber) protocol.ByteCount {
-	return 1 + quicvarint.Len(f.SequenceNumber) + quicvarint.Len(f.RetirePriorTo) + 1 /* connection ID length */ + protocol.ByteCount(f.ConnectionID.Len()) + 16
+func (f *NewConnectionIDFrame) Length(protocol.Version) protocol.ByteCount {
+	return 1 + protocol.ByteCount(quicvarint.Len(f.SequenceNumber)+quicvarint.Len(f.RetirePriorTo)+1 /* connection ID length */ +f.ConnectionID.Len()) + 16
 }

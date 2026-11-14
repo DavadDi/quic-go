@@ -1,214 +1,235 @@
 package self_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net"
+	"testing"
 	"time"
 
-	"github.com/lucas-clemente/quic-go"
+	"github.com/quic-go/quic-go"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("Stream deadline tests", func() {
-	setup := func() (quic.Listener, quic.Stream, quic.Stream) {
-		server, err := quic.ListenAddr("localhost:0", getTLSConfig(), getQuicConfig(nil))
-		Expect(err).ToNot(HaveOccurred())
-		strChan := make(chan quic.SendStream)
-		go func() {
-			defer GinkgoRecover()
-			sess, err := server.Accept(context.Background())
-			Expect(err).ToNot(HaveOccurred())
-			str, err := sess.AcceptStream(context.Background())
-			Expect(err).ToNot(HaveOccurred())
-			_, err = str.Read([]byte{0})
-			Expect(err).ToNot(HaveOccurred())
-			strChan <- str
-		}()
+func setupDeadlineTest(t *testing.T) (serverStr, clientStr *quic.Stream) {
+	t.Helper()
+	server, err := quic.Listen(newUDPConnLocalhost(t), getTLSConfig(), getQuicConfig(nil))
+	require.NoError(t, err)
+	t.Cleanup(func() { server.Close() })
 
-		sess, err := quic.DialAddr(
-			fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
-			getTLSClientConfig(),
-			getQuicConfig(nil),
-		)
-		Expect(err).ToNot(HaveOccurred())
-		clientStr, err := sess.OpenStream()
-		Expect(err).ToNot(HaveOccurred())
-		_, err = clientStr.Write([]byte{0}) // need to write one byte so the server learns about the stream
-		Expect(err).ToNot(HaveOccurred())
-		var serverStr quic.Stream
-		Eventually(strChan).Should(Receive(&serverStr))
-		return server, serverStr, clientStr
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	conn, err := quic.Dial(ctx, newUDPConnLocalhost(t), server.Addr(), getTLSClientConfig(), getQuicConfig(nil))
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.CloseWithError(0, "") })
+	clientStr, err = conn.OpenStream()
+	require.NoError(t, err)
+	_, err = clientStr.Write([]byte{0}) // need to write one byte so the server learns about the stream
+	require.NoError(t, err)
+
+	serverConn, err := server.Accept(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { serverConn.CloseWithError(0, "") })
+	serverStr, err = serverConn.AcceptStream(ctx)
+	require.NoError(t, err)
+
+	_, err = serverStr.Read([]byte{0})
+	require.NoError(t, err)
+	return serverStr, clientStr
+}
+
+func TestReadDeadlineSync(t *testing.T) {
+	serverStr, clientStr := setupDeadlineTest(t)
+
+	const timeout = time.Millisecond
+	errChan := make(chan error, 1)
+	go func() {
+		_, err := serverStr.Write(PRDataLong)
+		errChan <- err
+	}()
+
+	var bytesRead int
+	var timeoutCounter int
+	buf := make([]byte, 1<<10)
+	data := make([]byte, len(PRDataLong))
+	clientStr.SetReadDeadline(time.Now().Add(timeout))
+	for bytesRead < len(PRDataLong) {
+		n, err := clientStr.Read(buf)
+		if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+			timeoutCounter++
+			clientStr.SetReadDeadline(time.Now().Add(timeout))
+		} else {
+			require.NoError(t, err)
+		}
+		copy(data[bytesRead:], buf[:n])
+		bytesRead += n
+	}
+	require.Equal(t, PRDataLong, data)
+	// make sure the test actually worked and Read actually ran into the deadline a few times
+	t.Logf("ran into deadline %d times", timeoutCounter)
+	require.GreaterOrEqual(t, timeoutCounter, 10)
+	select {
+	case err := <-errChan:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+func TestReadDeadlineAsync(t *testing.T) {
+	serverStr, clientStr := setupDeadlineTest(t)
+
+	const timeout = time.Millisecond
+	errChan := make(chan error, 1)
+	go func() {
+		_, err := serverStr.Write(PRDataLong)
+		errChan <- err
+	}()
+
+	var bytesRead int
+	var timeoutCounter int
+	buf := make([]byte, 1<<10)
+	data := make([]byte, len(PRDataLong))
+	received := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-received:
+				return
+			default:
+				time.Sleep(timeout)
+			}
+			clientStr.SetReadDeadline(time.Now().Add(timeout))
+		}
+	}()
+
+	for bytesRead < len(PRDataLong) {
+		n, err := clientStr.Read(buf)
+		if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+			timeoutCounter++
+		} else {
+			require.NoError(t, err)
+		}
+		copy(data[bytesRead:], buf[:n])
+		bytesRead += n
 	}
 
-	Context("read deadlines", func() {
-		It("completes a transfer when the deadline is set", func() {
-			server, serverStr, clientStr := setup()
-			defer server.Close()
+	require.Equal(t, PRDataLong, data)
+	close(received)
 
-			const timeout = 20 * time.Millisecond
-			done := make(chan struct{})
-			go func() {
-				defer GinkgoRecover()
-				_, err := serverStr.Write(PRDataLong)
-				Expect(err).ToNot(HaveOccurred())
-				close(done)
-			}()
+	// make sure the test actually worked and Read actually ran into the deadline a few times
+	t.Logf("ran into deadline %d times", timeoutCounter)
+	require.GreaterOrEqual(t, timeoutCounter, 10)
+	select {
+	case err := <-errChan:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
 
-			var bytesRead int
-			var timeoutCounter int
-			buf := make([]byte, 1<<10)
-			data := make([]byte, len(PRDataLong))
-			clientStr.SetReadDeadline(time.Now().Add(timeout))
-			for bytesRead < len(PRDataLong) {
-				n, err := clientStr.Read(buf)
-				if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
-					timeoutCounter++
-					clientStr.SetReadDeadline(time.Now().Add(timeout))
-				} else {
-					Expect(err).ToNot(HaveOccurred())
-				}
-				copy(data[bytesRead:], buf[:n])
-				bytesRead += n
-			}
-			Expect(data).To(Equal(PRDataLong))
-			// make sure the test actually worked an Read actually ran into the deadline a few times
-			Expect(timeoutCounter).To(BeNumerically(">=", 10))
-			Eventually(done).Should(BeClosed())
-		})
+func TestWriteDeadlineSync(t *testing.T) {
+	serverStr, clientStr := setupDeadlineTest(t)
 
-		It("completes a transfer when the deadline is set concurrently", func() {
-			server, serverStr, clientStr := setup()
-			defer server.Close()
+	const timeout = time.Millisecond
 
-			const timeout = 20 * time.Millisecond
-			go func() {
-				defer GinkgoRecover()
-				_, err := serverStr.Write(PRDataLong)
-				Expect(err).ToNot(HaveOccurred())
-			}()
+	errChan := make(chan error, 1)
+	go func() {
+		defer close(errChan)
+		data, err := io.ReadAll(serverStr)
+		if err != nil {
+			errChan <- err
+		}
+		if !bytes.Equal(PRDataLong, data) {
+			errChan <- fmt.Errorf("data mismatch")
+		}
+	}()
 
-			var bytesRead int
-			var timeoutCounter int
-			buf := make([]byte, 1<<10)
-			data := make([]byte, len(PRDataLong))
-			clientStr.SetReadDeadline(time.Now().Add(timeout))
-			deadlineDone := make(chan struct{})
-			received := make(chan struct{})
-			go func() {
-				defer close(deadlineDone)
-				for {
-					select {
-					case <-received:
-						return
-					default:
-						time.Sleep(timeout)
-					}
-					clientStr.SetReadDeadline(time.Now().Add(timeout))
-				}
-			}()
-
-			for bytesRead < len(PRDataLong) {
-				n, err := clientStr.Read(buf)
-				if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
-					timeoutCounter++
-				} else {
-					Expect(err).ToNot(HaveOccurred())
-				}
-				copy(data[bytesRead:], buf[:n])
-				bytesRead += n
-			}
-			close(received)
-			Expect(data).To(Equal(PRDataLong))
-			// make sure the test actually worked an Read actually ran into the deadline a few times
-			Expect(timeoutCounter).To(BeNumerically(">=", 10))
-			Eventually(deadlineDone).Should(BeClosed())
-		})
-	})
-
-	Context("write deadlines", func() {
-		It("completes a transfer when the deadline is set", func() {
-			server, serverStr, clientStr := setup()
-			defer server.Close()
-
-			const timeout = 20 * time.Millisecond
-			done := make(chan struct{})
-			go func() {
-				defer GinkgoRecover()
-				data, err := io.ReadAll(serverStr)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(data).To(Equal(PRDataLong))
-				close(done)
-			}()
-
-			var bytesWritten int
-			var timeoutCounter int
+	var bytesWritten int
+	var timeoutCounter int
+	clientStr.SetWriteDeadline(time.Now().Add(timeout))
+	for bytesWritten < len(PRDataLong) {
+		n, err := clientStr.Write(PRDataLong[bytesWritten:])
+		if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+			timeoutCounter++
 			clientStr.SetWriteDeadline(time.Now().Add(timeout))
-			for bytesWritten < len(PRDataLong) {
-				n, err := clientStr.Write(PRDataLong[bytesWritten:])
-				if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
-					timeoutCounter++
-					clientStr.SetWriteDeadline(time.Now().Add(timeout))
-				} else {
-					Expect(err).ToNot(HaveOccurred())
-				}
-				bytesWritten += n
+		} else {
+			require.NoError(t, err)
+		}
+		bytesWritten += n
+	}
+	clientStr.Close()
+
+	// make sure the test actually worked and Write actually ran into the deadline a few times
+	t.Logf("ran into deadline %d times", timeoutCounter)
+	require.GreaterOrEqual(t, timeoutCounter, 10)
+	select {
+	case err := <-errChan:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+func TestWriteDeadlineAsync(t *testing.T) {
+	serverStr, clientStr := setupDeadlineTest(t)
+
+	const timeout = time.Millisecond
+
+	errChan := make(chan error, 1)
+	go func() {
+		defer close(errChan)
+		data, err := io.ReadAll(serverStr)
+		if err != nil {
+			errChan <- err
+		}
+		if !bytes.Equal(PRDataLong, data) {
+			errChan <- fmt.Errorf("data mismatch")
+		}
+	}()
+
+	clientStr.SetWriteDeadline(time.Now().Add(timeout))
+	readDone := make(chan struct{})
+	deadlineDone := make(chan struct{})
+	go func() {
+		defer close(deadlineDone)
+		for {
+			select {
+			case <-readDone:
+				return
+			default:
+				time.Sleep(timeout)
 			}
-			clientStr.Close()
-			// make sure the test actually worked an Read actually ran into the deadline a few times
-			Expect(timeoutCounter).To(BeNumerically(">=", 10))
-			Eventually(done).Should(BeClosed())
-		})
-
-		It("completes a transfer when the deadline is set concurrently", func() {
-			server, serverStr, clientStr := setup()
-			defer server.Close()
-
-			const timeout = 20 * time.Millisecond
-			readDone := make(chan struct{})
-			go func() {
-				defer GinkgoRecover()
-				data, err := io.ReadAll(serverStr)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(data).To(Equal(PRDataLong))
-				close(readDone)
-			}()
-
 			clientStr.SetWriteDeadline(time.Now().Add(timeout))
-			deadlineDone := make(chan struct{})
-			go func() {
-				defer close(deadlineDone)
-				for {
-					select {
-					case <-readDone:
-						return
-					default:
-						time.Sleep(timeout)
-					}
-					clientStr.SetWriteDeadline(time.Now().Add(timeout))
-				}
-			}()
+		}
+	}()
 
-			var bytesWritten int
-			var timeoutCounter int
-			clientStr.SetWriteDeadline(time.Now().Add(timeout))
-			for bytesWritten < len(PRDataLong) {
-				n, err := clientStr.Write(PRDataLong[bytesWritten:])
-				if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
-					timeoutCounter++
-				} else {
-					Expect(err).ToNot(HaveOccurred())
-				}
-				bytesWritten += n
-			}
-			clientStr.Close()
-			// make sure the test actually worked an Read actually ran into the deadline a few times
-			Expect(timeoutCounter).To(BeNumerically(">=", 10))
-			Eventually(readDone).Should(BeClosed())
-			Eventually(deadlineDone).Should(BeClosed())
-		})
-	})
-})
+	var bytesWritten int
+	var timeoutCounter int
+	clientStr.SetWriteDeadline(time.Now().Add(timeout))
+	for bytesWritten < len(PRDataLong) {
+		n, err := clientStr.Write(PRDataLong[bytesWritten:])
+		if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+			timeoutCounter++
+		} else {
+			require.NoError(t, err)
+		}
+		bytesWritten += n
+	}
+	clientStr.Close()
+
+	close(readDone)
+
+	// make sure the test actually worked and Write actually ran into the deadline a few times
+	t.Logf("ran into deadline %d times", timeoutCounter)
+	require.GreaterOrEqual(t, timeoutCounter, 10)
+	select {
+	case err := <-errChan:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}

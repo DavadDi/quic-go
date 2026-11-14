@@ -1,187 +1,288 @@
 package quic
 
 import (
-	"crypto/rand"
 	"fmt"
+	mrand "math/rand/v2"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
 
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/internal/qerr"
-	"github.com/lucas-clemente/quic-go/internal/wire"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/qerr"
+	"github.com/quic-go/quic-go/internal/wire"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
-func createHandshakeMessage(len int) []byte {
-	msg := make([]byte, 4+len)
-	rand.Read(msg[:1]) // random message type
-	msg[1] = uint8(len >> 16)
-	msg[2] = uint8(len >> 8)
-	msg[3] = uint8(len)
-	rand.Read(msg[4:])
-	return msg
+func TestCryptoStreamDataAssembly(t *testing.T) {
+	str := newCryptoStream()
+	require.NoError(t, str.HandleCryptoFrame(&wire.CryptoFrame{Data: []byte("bar"), Offset: 3}))
+	require.NoError(t, str.HandleCryptoFrame(&wire.CryptoFrame{Data: []byte("foo")}))
+	// receive a retransmission
+	require.NoError(t, str.HandleCryptoFrame(&wire.CryptoFrame{Data: []byte("bar"), Offset: 3}))
+
+	var data []byte
+	for {
+		b := str.GetCryptoData()
+		if b == nil {
+			break
+		}
+		data = append(data, b...)
+	}
+	require.Equal(t, []byte("foobar"), data)
 }
 
-var _ = Describe("Crypto Stream", func() {
-	var str cryptoStream
+func TestCryptoStreamMaxOffset(t *testing.T) {
+	str := newCryptoStream()
+	require.NoError(t, str.HandleCryptoFrame(&wire.CryptoFrame{
+		Offset: protocol.MaxCryptoStreamOffset - 5,
+		Data:   []byte("foo"),
+	}))
+	require.ErrorIs(t,
+		str.HandleCryptoFrame(&wire.CryptoFrame{
+			Offset: protocol.MaxCryptoStreamOffset - 2,
+			Data:   []byte("bar"),
+		}),
+		&qerr.TransportError{ErrorCode: qerr.CryptoBufferExceeded},
+	)
+}
 
-	BeforeEach(func() {
-		str = newCryptoStream()
+func TestCryptoStreamFinishWithQueuedData(t *testing.T) {
+	t.Run("with data at current offset", func(t *testing.T) {
+		str := newCryptoStream()
+		require.NoError(t, str.HandleCryptoFrame(&wire.CryptoFrame{Data: []byte("foo")}))
+		require.Equal(t, []byte("foo"), str.GetCryptoData())
+		require.NoError(t, str.HandleCryptoFrame(&wire.CryptoFrame{Data: []byte("bar"), Offset: 3}))
+		require.ErrorIs(t, str.Finish(), &qerr.TransportError{ErrorCode: qerr.ProtocolViolation})
 	})
 
-	Context("handling incoming data", func() {
-		It("handles in-order CRYPTO frames", func() {
-			msg := createHandshakeMessage(6)
-			err := str.HandleCryptoFrame(&wire.CryptoFrame{Data: msg})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(str.GetCryptoData()).To(Equal(msg))
-			Expect(str.GetCryptoData()).To(BeNil())
-		})
-
-		It("handles multiple messages in one CRYPTO frame", func() {
-			msg1 := createHandshakeMessage(6)
-			msg2 := createHandshakeMessage(10)
-			msg := append(append([]byte{}, msg1...), msg2...)
-			err := str.HandleCryptoFrame(&wire.CryptoFrame{Data: msg})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(str.GetCryptoData()).To(Equal(msg1))
-			Expect(str.GetCryptoData()).To(Equal(msg2))
-			Expect(str.GetCryptoData()).To(BeNil())
-		})
-
-		It("errors if the frame exceeds the maximum offset", func() {
-			Expect(str.HandleCryptoFrame(&wire.CryptoFrame{
-				Offset: protocol.MaxCryptoStreamOffset - 5,
-				Data:   []byte("foobar"),
-			})).To(MatchError(&qerr.TransportError{
-				ErrorCode:    qerr.CryptoBufferExceeded,
-				ErrorMessage: fmt.Sprintf("received invalid offset %d on crypto stream, maximum allowed %d", protocol.MaxCryptoStreamOffset+1, protocol.MaxCryptoStreamOffset),
-			}))
-		})
-
-		It("handles messages split over multiple CRYPTO frames", func() {
-			msg := createHandshakeMessage(6)
-			err := str.HandleCryptoFrame(&wire.CryptoFrame{
-				Data: msg[:4],
-			})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(str.GetCryptoData()).To(BeNil())
-			err = str.HandleCryptoFrame(&wire.CryptoFrame{
-				Offset: 4,
-				Data:   msg[4:],
-			})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(str.GetCryptoData()).To(Equal(msg))
-			Expect(str.GetCryptoData()).To(BeNil())
-		})
-
-		It("handles out-of-order CRYPTO frames", func() {
-			msg := createHandshakeMessage(6)
-			err := str.HandleCryptoFrame(&wire.CryptoFrame{
-				Offset: 4,
-				Data:   msg[4:],
-			})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(str.GetCryptoData()).To(BeNil())
-			err = str.HandleCryptoFrame(&wire.CryptoFrame{
-				Data: msg[:4],
-			})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(str.GetCryptoData()).To(Equal(msg))
-			Expect(str.GetCryptoData()).To(BeNil())
-		})
-
-		Context("finishing", func() {
-			It("errors if there's still data to read after finishing", func() {
-				Expect(str.HandleCryptoFrame(&wire.CryptoFrame{
-					Data:   createHandshakeMessage(5),
-					Offset: 10,
-				})).To(Succeed())
-				Expect(str.Finish()).To(MatchError(&qerr.TransportError{
-					ErrorCode:    qerr.ProtocolViolation,
-					ErrorMessage: "encryption level changed, but crypto stream has more data to read",
-				}))
-			})
-
-			It("works with reordered data", func() {
-				f1 := &wire.CryptoFrame{
-					Data: []byte("foo"),
-				}
-				f2 := &wire.CryptoFrame{
-					Offset: 3,
-					Data:   []byte("bar"),
-				}
-				Expect(str.HandleCryptoFrame(f2)).To(Succeed())
-				Expect(str.HandleCryptoFrame(f1)).To(Succeed())
-				Expect(str.Finish()).To(Succeed())
-				Expect(str.HandleCryptoFrame(f2)).To(Succeed())
-			})
-
-			It("rejects new crypto data after finishing", func() {
-				Expect(str.Finish()).To(Succeed())
-				Expect(str.HandleCryptoFrame(&wire.CryptoFrame{
-					Data: createHandshakeMessage(5),
-				})).To(MatchError(&qerr.TransportError{
-					ErrorCode:    qerr.ProtocolViolation,
-					ErrorMessage: "received crypto data after change of encryption level",
-				}))
-			})
-
-			It("ignores crypto data below the maximum offset received before finishing", func() {
-				msg := createHandshakeMessage(15)
-				Expect(str.HandleCryptoFrame(&wire.CryptoFrame{
-					Data: msg,
-				})).To(Succeed())
-				Expect(str.GetCryptoData()).To(Equal(msg))
-				Expect(str.Finish()).To(Succeed())
-				Expect(str.HandleCryptoFrame(&wire.CryptoFrame{
-					Offset: protocol.ByteCount(len(msg) - 6),
-					Data:   []byte("foobar"),
-				})).To(Succeed())
-			})
-		})
+	t.Run("with data at a higher offset", func(t *testing.T) {
+		str := newCryptoStream()
+		require.NoError(t, str.HandleCryptoFrame(&wire.CryptoFrame{Data: []byte("foobar"), Offset: 20}))
+		require.ErrorIs(t, str.Finish(), &qerr.TransportError{ErrorCode: qerr.ProtocolViolation})
 	})
+}
 
-	Context("writing data", func() {
-		It("says if it has data", func() {
-			Expect(str.HasData()).To(BeFalse())
-			_, err := str.Write([]byte("foobar"))
-			Expect(err).ToNot(HaveOccurred())
-			Expect(str.HasData()).To(BeTrue())
-		})
+func TestCryptoStreamReceiveDataAfterFinish(t *testing.T) {
+	str := newCryptoStream()
+	require.NoError(t, str.HandleCryptoFrame(&wire.CryptoFrame{Data: []byte("foobar")}))
+	require.Equal(t, []byte("foobar"), str.GetCryptoData())
+	require.NoError(t, str.Finish())
+	// receiving a retransmission is ok
+	require.NoError(t, str.HandleCryptoFrame(&wire.CryptoFrame{Data: []byte("bar"), Offset: 3}))
+	// but receiving new data is not
+	require.ErrorIs(t,
+		str.HandleCryptoFrame(&wire.CryptoFrame{Data: []byte("baz"), Offset: 4}),
+		&qerr.TransportError{ErrorCode: qerr.ProtocolViolation},
+	)
+}
 
-		It("pops crypto frames", func() {
-			_, err := str.Write([]byte("foobar"))
-			Expect(err).ToNot(HaveOccurred())
-			f := str.PopCryptoFrame(1000)
-			Expect(f).ToNot(BeNil())
-			Expect(f.Offset).To(BeZero())
-			Expect(f.Data).To(Equal([]byte("foobar")))
-		})
+func expectedCryptoFrameLen(offset protocol.ByteCount) protocol.ByteCount {
+	f := &wire.CryptoFrame{Offset: offset}
+	return f.Length(protocol.Version1)
+}
 
-		It("coalesces multiple writes", func() {
-			_, err := str.Write([]byte("foo"))
-			Expect(err).ToNot(HaveOccurred())
-			_, err = str.Write([]byte("bar"))
-			Expect(err).ToNot(HaveOccurred())
-			f := str.PopCryptoFrame(1000)
-			Expect(f).ToNot(BeNil())
-			Expect(f.Offset).To(BeZero())
-			Expect(f.Data).To(Equal([]byte("foobar")))
-		})
+func TestCryptoStreamWrite(t *testing.T) {
+	str := newCryptoStream()
 
-		It("respects the maximum size", func() {
-			frameHeaderLen := (&wire.CryptoFrame{}).Length(protocol.VersionWhatever)
-			_, err := str.Write([]byte("foobar"))
-			Expect(err).ToNot(HaveOccurred())
-			f := str.PopCryptoFrame(frameHeaderLen + 3)
-			Expect(f).ToNot(BeNil())
-			Expect(f.Offset).To(BeZero())
-			Expect(f.Data).To(Equal([]byte("foo")))
-			f = str.PopCryptoFrame(frameHeaderLen + 3)
-			Expect(f).ToNot(BeNil())
-			Expect(f.Offset).To(Equal(protocol.ByteCount(3)))
-			Expect(f.Data).To(Equal([]byte("bar")))
+	require.False(t, str.HasData())
+	_, err := str.Write([]byte("foo"))
+	require.NoError(t, err)
+	require.True(t, str.HasData())
+	_, err = str.Write([]byte("bar"))
+	require.NoError(t, err)
+	_, err = str.Write([]byte("baz"))
+	require.NoError(t, err)
+	require.True(t, str.HasData())
+
+	for i := range expectedCryptoFrameLen(0) {
+		require.Nil(t, str.PopCryptoFrame(i))
+	}
+
+	f := str.PopCryptoFrame(expectedCryptoFrameLen(0) + 1)
+	require.Equal(t, &wire.CryptoFrame{Data: []byte("f")}, f)
+	require.True(t, str.HasData())
+	f = str.PopCryptoFrame(expectedCryptoFrameLen(1) + 3)
+	// the three write calls were coalesced into a single frame
+	require.Equal(t, &wire.CryptoFrame{Offset: 1, Data: []byte("oob")}, f)
+	f = str.PopCryptoFrame(protocol.MaxByteCount)
+	require.Equal(t, &wire.CryptoFrame{Offset: 4, Data: []byte("arbaz")}, f)
+	require.False(t, str.HasData())
+}
+
+func TestInitialCryptoStreamServer(t *testing.T) {
+	str := newInitialCryptoStream(false)
+	_, err := str.Write([]byte("foobar"))
+	require.NoError(t, err)
+
+	f := str.PopCryptoFrame(expectedCryptoFrameLen(0) + 3)
+	require.Equal(t, &wire.CryptoFrame{Offset: 0, Data: []byte("foo")}, f)
+	require.True(t, str.HasData())
+
+	// append another CRYPTO frame to the existing slice
+	f = str.PopCryptoFrame(expectedCryptoFrameLen(3) + 3)
+	require.Equal(t, &wire.CryptoFrame{Offset: 3, Data: []byte("bar")}, f)
+	require.False(t, str.HasData())
+}
+
+func reassembleCryptoData(t *testing.T, segments map[protocol.ByteCount][]byte) []byte {
+	t.Helper()
+
+	var reassembled []byte
+	var offset protocol.ByteCount
+	for len(segments) > 0 {
+		b, ok := segments[offset]
+		if !ok {
+			break
+		}
+		reassembled = append(reassembled, b...)
+		delete(segments, offset)
+		offset = protocol.ByteCount(len(reassembled))
+	}
+	require.Empty(t, segments)
+	return reassembled
+}
+
+func skipIfDisableScramblingEnvSet(t *testing.T) {
+	t.Helper()
+	disabled, err := strconv.ParseBool(os.Getenv(disableClientHelloScramblingEnv))
+	if err == nil && disabled {
+		t.Skip("ClientHello scrambling disabled via " + disableClientHelloScramblingEnv)
+	}
+}
+
+func TestInitialCryptoStreamClientStatic(t *testing.T) {
+	skipIfDisableScramblingEnvSet(t)
+
+	str := newInitialCryptoStream(true)
+	clientHello, err := getClientHello("quic-go.net")
+	require.NoError(t, err)
+	_, err = str.Write(clientHello)
+	require.NoError(t, err)
+	require.True(t, str.HasData())
+	_, err = str.Write([]byte("foobar"))
+	require.NoError(t, err)
+
+	segments := make(map[protocol.ByteCount][]byte)
+
+	f1 := str.PopCryptoFrame(protocol.MaxByteCount)
+	require.NotNil(t, f1)
+	segments[f1.Offset] = f1.Data
+	require.True(t, str.HasData())
+
+	f2 := str.PopCryptoFrame(protocol.MaxByteCount)
+	require.NotNil(t, f2)
+	require.NotContains(t, segments, f2.Offset)
+	segments[f2.Offset] = f2.Data
+	require.True(t, str.HasData())
+	require.NotEqual(t, f2.Offset, protocol.ByteCount(len(f1.Data)))
+
+	f3 := str.PopCryptoFrame(protocol.MaxByteCount)
+	require.NotNil(t, f2)
+	require.NotContains(t, segments, f3.Offset)
+	segments[f3.Offset] = f3.Data
+	require.True(t, str.HasData())
+	require.NotEqual(t, f3.Offset, protocol.ByteCount(len(f2.Data)))
+
+	f4 := str.PopCryptoFrame(protocol.MaxByteCount)
+	require.NotNil(t, f4)
+	require.NotContains(t, segments, f4.Offset)
+	segments[f4.Offset] = f4.Data
+	require.Equal(t, []byte("foobar"), f4.Data)
+	require.False(t, str.HasData())
+	require.NotEqual(t, f4.Offset, protocol.ByteCount(len(f3.Data)))
+
+	reassembled := reassembleCryptoData(t, segments)
+	require.Equal(t, append(clientHello, []byte("foobar")...), reassembled)
+}
+
+func randomDomainName(length int) string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz"
+	b := make([]byte, length)
+	for i := range b {
+		if i > 0 && i < length-1 && mrand.IntN(5) == 0 && b[i-1] != '.' {
+			b[i] = '.'
+		} else {
+			b[i] = alphabet[mrand.IntN(len(alphabet))]
+		}
+	}
+	return string(b)
+}
+
+func TestInitialCryptoStreamClientRandomizedSizes(t *testing.T) {
+	skipIfDisableScramblingEnvSet(t)
+
+	for i := range 100 {
+		t.Run(fmt.Sprintf("run %d", i), func(t *testing.T) {
+			var serverName string
+			if mrand.Int()%4 > 0 {
+				serverName = randomDomainName(6 + mrand.IntN(20))
+			}
+			var clientHello []byte
+			if serverName == "" || !strings.Contains(serverName, ".") || mrand.Int()%2 == 0 {
+				t.Logf("using a ClientHello without ECH, hostname: %q", serverName)
+				var err error
+				clientHello, err = getClientHello(serverName)
+				require.NoError(t, err)
+			} else {
+				t.Logf("using a ClientHello with ECH, hostname: %q", serverName)
+				var err error
+				clientHello, err = getClientHelloWithECH(serverName)
+				require.NoError(t, err)
+			}
+			testInitialCryptoStreamClientRandomizedSizes(t, clientHello, serverName)
 		})
-	})
-})
+	}
+}
+
+func testInitialCryptoStreamClientRandomizedSizes(t *testing.T, clientHello []byte, expectedServerName string) {
+	str := newInitialCryptoStream(true)
+
+	b := slices.Clone(clientHello)
+	for len(b) > 0 {
+		n := min(len(b), mrand.IntN(2*len(b)))
+		_, err := str.Write(b[:n])
+		require.NoError(t, err)
+		b = b[n:]
+	}
+
+	require.True(t, str.HasData())
+	_, err := str.Write([]byte("foobar"))
+	require.NoError(t, err)
+
+	segments := make(map[protocol.ByteCount][]byte)
+
+	var frames []*wire.CryptoFrame
+	for str.HasData() {
+		// fmt.Println("popping a frame")
+		var maxSize protocol.ByteCount
+		if mrand.Int()%4 == 0 {
+			maxSize = protocol.ByteCount(mrand.IntN(512) + 1)
+		} else {
+			maxSize = protocol.ByteCount(mrand.IntN(32) + 1)
+		}
+		f := str.PopCryptoFrame(maxSize)
+		if f == nil {
+			continue
+		}
+		frames = append(frames, f)
+		require.LessOrEqual(t, f.Length(protocol.Version1), maxSize)
+	}
+	t.Logf("received %d frames", len(frames))
+
+	for _, f := range frames {
+		t.Logf("offset %d: %d bytes", f.Offset, len(f.Data))
+		if expectedServerName != "" {
+			require.NotContainsf(t, string(f.Data), expectedServerName, "frame at offset %d contains the server name", f.Offset)
+		}
+		segments[f.Offset] = f.Data
+	}
+
+	reassembled := reassembleCryptoData(t, segments)
+	require.Equal(t, append(clientHello, []byte("foobar")...), reassembled)
+	if expectedServerName != "" {
+		require.Contains(t, string(reassembled), expectedServerName)
+	}
+}

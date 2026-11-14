@@ -1,60 +1,69 @@
 package quic
 
 import (
-	"errors"
+	"fmt"
 	"time"
 
-	"github.com/lucas-clemente/quic-go/internal/utils"
-
-	"github.com/lucas-clemente/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
-// Clone clones a Config
+// Clone clones a Config.
 func (c *Config) Clone() *Config {
 	copy := *c
 	return &copy
 }
 
 func (c *Config) handshakeTimeout() time.Duration {
-	return utils.MaxDuration(protocol.DefaultHandshakeTimeout, 2*c.HandshakeIdleTimeout)
+	return 2 * c.HandshakeIdleTimeout
+}
+
+func (c *Config) maxRetryTokenAge() time.Duration {
+	return c.handshakeTimeout()
+}
+
+func (c *Config) initialPacketSize() protocol.ByteCount {
+	if c.InitialPacketSize == 0 {
+		return protocol.InitialPacketSize
+	}
+	return protocol.ByteCount(c.InitialPacketSize)
 }
 
 func validateConfig(config *Config) error {
 	if config == nil {
 		return nil
 	}
-	if config.MaxIncomingStreams > 1<<60 {
-		return errors.New("invalid value for Config.MaxIncomingStreams")
+	const maxStreams = 1 << 60
+	if config.MaxIncomingStreams > maxStreams {
+		config.MaxIncomingStreams = maxStreams
 	}
-	if config.MaxIncomingUniStreams > 1<<60 {
-		return errors.New("invalid value for Config.MaxIncomingUniStreams")
+	if config.MaxIncomingUniStreams > maxStreams {
+		config.MaxIncomingUniStreams = maxStreams
+	}
+	if config.MaxStreamReceiveWindow > quicvarint.Max {
+		config.MaxStreamReceiveWindow = quicvarint.Max
+	}
+	if config.MaxConnectionReceiveWindow > quicvarint.Max {
+		config.MaxConnectionReceiveWindow = quicvarint.Max
+	}
+	if config.InitialPacketSize > 0 && config.InitialPacketSize < protocol.MinInitialPacketSize {
+		config.InitialPacketSize = protocol.MinInitialPacketSize
+	}
+	if config.InitialPacketSize > protocol.MaxPacketBufferSize {
+		config.InitialPacketSize = protocol.MaxPacketBufferSize
+	}
+	// check that all QUIC versions are actually supported
+	for _, v := range config.Versions {
+		if !protocol.IsValidVersion(v) {
+			return fmt.Errorf("invalid QUIC version: %s", v)
+		}
 	}
 	return nil
 }
 
-// populateServerConfig populates fields in the quic.Config with their default values, if none are set
+// populateConfig populates fields in the quic.Config with their default values, if none are set
 // it may be called with nil
-func populateServerConfig(config *Config) *Config {
-	config = populateConfig(config)
-	if config.ConnectionIDLength == 0 {
-		config.ConnectionIDLength = protocol.DefaultConnectionIDLength
-	}
-	if config.AcceptToken == nil {
-		config.AcceptToken = defaultAcceptToken
-	}
-	return config
-}
-
-// populateClientConfig populates fields in the quic.Config with their default values, if none are set
-// it may be called with nil
-func populateClientConfig(config *Config, createdPacketConn bool) *Config {
-	config = populateConfig(config)
-	if config.ConnectionIDLength == 0 && !createdPacketConn {
-		config.ConnectionIDLength = protocol.DefaultConnectionIDLength
-	}
-	return config
-}
-
+// InitialPacketSize keeps zero to distinguish the default from an explicit packet-size floor.
 func populateConfig(config *Config) *Config {
 	if config == nil {
 		config = &Config{}
@@ -99,25 +108,26 @@ func populateConfig(config *Config) *Config {
 	} else if maxIncomingUniStreams < 0 {
 		maxIncomingUniStreams = 0
 	}
-
 	return &Config{
+		GetConfigForClient:               config.GetConfigForClient,
 		Versions:                         versions,
 		HandshakeIdleTimeout:             handshakeIdleTimeout,
 		MaxIdleTimeout:                   idleTimeout,
-		AcceptToken:                      config.AcceptToken,
-		KeepAlive:                        config.KeepAlive,
+		KeepAlivePeriod:                  config.KeepAlivePeriod,
 		InitialStreamReceiveWindow:       initialStreamReceiveWindow,
 		MaxStreamReceiveWindow:           maxStreamReceiveWindow,
 		InitialConnectionReceiveWindow:   initialConnectionReceiveWindow,
 		MaxConnectionReceiveWindow:       maxConnectionReceiveWindow,
+		AllowConnectionWindowIncrease:    config.AllowConnectionWindowIncrease,
 		MaxIncomingStreams:               maxIncomingStreams,
 		MaxIncomingUniStreams:            maxIncomingUniStreams,
-		ConnectionIDLength:               config.ConnectionIDLength,
-		StatelessResetKey:                config.StatelessResetKey,
+		RequireStreamCreditRelease:       config.RequireStreamCreditRelease,
 		TokenStore:                       config.TokenStore,
 		EnableDatagrams:                  config.EnableDatagrams,
+		InitialPacketSize:                config.InitialPacketSize,
 		DisablePathMTUDiscovery:          config.DisablePathMTUDiscovery,
-		DisableVersionNegotiationPackets: config.DisableVersionNegotiationPackets,
+		EnableStreamResetPartialDelivery: config.EnableStreamResetPartialDelivery,
+		Allow0RTT:                        config.Allow0RTT,
 		Tracer:                           config.Tracer,
 	}
 }

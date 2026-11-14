@@ -3,7 +3,7 @@ package testdata
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"io/ioutil"
+	"os"
 	"path"
 	"runtime"
 )
@@ -31,6 +31,7 @@ func GetTLSConfig() *tls.Config {
 		panic(err)
 	}
 	return &tls.Config{
+		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{cert},
 	}
 }
@@ -38,7 +39,7 @@ func GetTLSConfig() *tls.Config {
 // AddRootCA adds the root CA certificate to a cert pool
 func AddRootCA(certPool *x509.CertPool) {
 	caCertPath := path.Join(certPath, "ca.pem")
-	caCertRaw, err := ioutil.ReadFile(caCertPath)
+	caCertRaw, err := os.ReadFile(caCertPath)
 	if err != nil {
 		panic(err)
 	}

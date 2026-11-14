@@ -2,102 +2,92 @@ package self_test
 
 import (
 	"context"
-	"fmt"
 	"io"
-	"net"
+	"testing"
+	"time"
 
-	quic "github.com/lucas-clemente/quic-go"
-	"github.com/lucas-clemente/quic-go/internal/handshake"
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/logging"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/internal/handshake"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
+	"github.com/quic-go/quic-go/testutils/events"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-var (
-	sentHeaders     []*logging.ExtendedHeader
-	receivedHeaders []*logging.ExtendedHeader
-)
+func TestKeyUpdates(t *testing.T) {
+	reset := handshake.SetKeyUpdateInterval(1) // update keys as frequently as possible
+	t.Cleanup(reset)
 
-func countKeyPhases() (sent, received int) {
-	lastKeyPhase := protocol.KeyPhaseOne
-	for _, hdr := range sentHeaders {
-		if hdr.IsLongHeader {
-			continue
+	countKeyPhases := func(events []qlogwriter.Event) (sent, received int) {
+		lastKeyPhaseSend := protocol.KeyPhaseOne
+		lastKeyPhaseReceive := protocol.KeyPhaseOne
+		for _, ev := range events {
+			switch ev := ev.(type) {
+			case qlog.PacketSent:
+				if ev.Header.KeyPhaseBit != lastKeyPhaseSend {
+					sent++
+					lastKeyPhaseSend = ev.Header.KeyPhaseBit
+				}
+			case qlog.PacketReceived:
+				if ev.Header.KeyPhaseBit != lastKeyPhaseReceive {
+					received++
+					lastKeyPhaseReceive = ev.Header.KeyPhaseBit
+				}
+			}
 		}
-		if hdr.KeyPhase != lastKeyPhase {
-			sent++
-			lastKeyPhase = hdr.KeyPhase
-		}
-	}
-	lastKeyPhase = protocol.KeyPhaseOne
-	for _, hdr := range receivedHeaders {
-		if hdr.IsLongHeader {
-			continue
-		}
-		if hdr.KeyPhase != lastKeyPhase {
-			received++
-			lastKeyPhase = hdr.KeyPhase
-		}
-	}
-	return
-}
-
-type keyUpdateConnTracer struct {
-	connTracer
-}
-
-func (t *keyUpdateConnTracer) SentPacket(hdr *logging.ExtendedHeader, size logging.ByteCount, ack *logging.AckFrame, frames []logging.Frame) {
-	sentHeaders = append(sentHeaders, hdr)
-}
-
-func (t *keyUpdateConnTracer) ReceivedPacket(hdr *logging.ExtendedHeader, size logging.ByteCount, frames []logging.Frame) {
-	receivedHeaders = append(receivedHeaders, hdr)
-}
-
-var _ = Describe("Key Update tests", func() {
-	var server quic.Listener
-
-	runServer := func() {
-		var err error
-		server, err = quic.ListenAddr("localhost:0", getTLSConfig(), nil)
-		Expect(err).ToNot(HaveOccurred())
-
-		go func() {
-			defer GinkgoRecover()
-			sess, err := server.Accept(context.Background())
-			Expect(err).ToNot(HaveOccurred())
-			str, err := sess.OpenUniStream()
-			Expect(err).ToNot(HaveOccurred())
-			defer str.Close()
-			_, err = str.Write(PRDataLong)
-			Expect(err).ToNot(HaveOccurred())
-		}()
+		return
 	}
 
-	It("downloads a large file", func() {
-		origKeyUpdateInterval := handshake.KeyUpdateInterval
-		defer func() { handshake.KeyUpdateInterval = origKeyUpdateInterval }()
-		handshake.KeyUpdateInterval = 1 // update keys as frequently as possible
+	server, err := quic.Listen(newUDPConnLocalhost(t), getTLSConfig(), nil)
+	require.NoError(t, err)
+	defer server.Close()
 
-		runServer()
-		sess, err := quic.DialAddr(
-			fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
-			getTLSClientConfig(),
-			getQuicConfig(&quic.Config{Tracer: newTracer(func() logging.ConnectionTracer { return &keyUpdateConnTracer{} })}),
-		)
-		Expect(err).ToNot(HaveOccurred())
-		str, err := sess.AcceptUniStream(context.Background())
-		Expect(err).ToNot(HaveOccurred())
-		data, err := io.ReadAll(str)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(data).To(Equal(PRDataLong))
-		Expect(sess.CloseWithError(0, "")).To(Succeed())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var eventRecorder events.Recorder
+	conn, err := quic.Dial(
+		ctx,
+		newUDPConnLocalhost(t),
+		server.Addr(),
+		getTLSClientConfig(),
+		getQuicConfig(&quic.Config{Tracer: newTracer(&eventRecorder)}),
+	)
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "")
 
-		keyPhasesSent, keyPhasesReceived := countKeyPhases()
-		fmt.Fprintf(GinkgoWriter, "Used %d key phases on outgoing and %d key phases on incoming packets.\n", keyPhasesSent, keyPhasesReceived)
-		Expect(keyPhasesReceived).To(BeNumerically(">", 10))
-		Expect(keyPhasesReceived).To(BeNumerically("~", keyPhasesSent, 2))
-	})
-})
+	serverConn, err := server.Accept(ctx)
+	require.NoError(t, err)
+	defer serverConn.CloseWithError(0, "")
+
+	serverErrChan := make(chan error, 1)
+	go func() {
+		str, err := serverConn.OpenUniStream()
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+		defer str.Close()
+		if _, err := str.Write(PRDataLong); err != nil {
+			serverErrChan <- err
+			return
+		}
+		close(serverErrChan)
+	}()
+
+	str, err := conn.AcceptUniStream(ctx)
+	require.NoError(t, err)
+	data, err := io.ReadAll(str)
+	require.NoError(t, err)
+	require.Equal(t, PRDataLong, data)
+	require.NoError(t, conn.CloseWithError(0, ""))
+
+	require.NoError(t, <-serverErrChan)
+
+	keyPhasesSent, keyPhasesReceived := countKeyPhases(eventRecorder.Events())
+	t.Logf("Used %d key phases on outgoing and %d key phases on incoming packets.", keyPhasesSent, keyPhasesReceived)
+	assert.Greater(t, keyPhasesReceived, 10)
+	assert.InDelta(t, keyPhasesSent, keyPhasesReceived, 2)
+}

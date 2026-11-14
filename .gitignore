@@ -4,6 +4,7 @@ main
 mockgen_tmp.go
 *.qtr
 *.qlog
+*.sqlog
 *.txt
 race.[0-9]*
 
@@ -13,5 +14,7 @@ fuzzing/*/crashers
 fuzzing/*/sonarprofile
 fuzzing/*/suppressions
 fuzzing/*/corpus/
+
+**/testdata/fuzz/
 
 gomock_reflect_*/

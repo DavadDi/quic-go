@@ -8,14 +8,12 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/lucas-clemente/quic-go"
-	"github.com/lucas-clemente/quic-go/http3"
-	"github.com/lucas-clemente/quic-go/interop/http09"
-	"github.com/lucas-clemente/quic-go/interop/utils"
-	"github.com/lucas-clemente/quic-go/qlog"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/internal/qtls"
+	"github.com/quic-go/quic-go/interop/http09"
+	"github.com/quic-go/quic-go/interop/utils"
 )
-
-var tlsConf *tls.Config
 
 func main() {
 	logFile, err := os.Create("/logs/log.txt")
@@ -37,38 +35,31 @@ func main() {
 
 	testcase := os.Getenv("TESTCASE")
 
-	getLogWriter, err := utils.GetQLOGWriter()
-	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
-	}
-	// a quic.Config that doesn't do a Retry
 	quicConf := &quic.Config{
-		AcceptToken: func(_ net.Addr, _ *quic.Token) bool { return true },
-		Tracer:      qlog.NewTracer(getLogWriter),
+		Allow0RTT: testcase == "zerortt",
+		Tracer:    utils.NewQLOGConnectionTracer,
 	}
 	cert, err := tls.LoadX509KeyPair("/certs/cert.pem", "/certs/priv.key")
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	tlsConf = &tls.Config{
+	tlsConf := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		KeyLogWriter: keyLog,
+		NextProtos:   []string{http09.NextProto},
 	}
 
 	switch testcase {
-	case "versionnegotiation", "handshake", "transfer", "resumption", "zerortt", "multiconnect":
-		err = runHTTP09Server(quicConf)
+	case "versionnegotiation", "handshake", "retry", "transfer", "resumption", "multiconnect", "zerortt":
+		err = runHTTP09Server(tlsConf, quicConf, testcase == "retry")
 	case "chacha20":
-		tlsConf.CipherSuites = []uint16{tls.TLS_CHACHA20_POLY1305_SHA256}
-		err = runHTTP09Server(quicConf)
-	case "retry":
-		// By default, quic-go performs a Retry on every incoming connection.
-		quicConf.AcceptToken = nil
-		err = runHTTP09Server(quicConf)
+		reset := qtls.SetCipherSuite(tls.TLS_CHACHA20_POLY1305_SHA256)
+		defer reset()
+		err = runHTTP09Server(tlsConf, quicConf, false)
 	case "http3":
-		err = runHTTP3Server(quicConf)
+		tlsConf.NextProtos = []string{http3.NextProtoH3}
+		err = runHTTP3Server(tlsConf, quicConf)
 	default:
 		fmt.Printf("unsupported test case: %s\n", testcase)
 		os.Exit(127)
@@ -80,25 +71,34 @@ func main() {
 	}
 }
 
-func runHTTP09Server(quicConf *quic.Config) error {
-	server := http09.Server{
-		Server: &http.Server{
-			Addr:      ":443",
-			TLSConfig: tlsConf,
-		},
-		QuicConfig: quicConf,
-	}
+func runHTTP09Server(tlsConf *tls.Config, quicConf *quic.Config, forceRetry bool) error {
 	http.DefaultServeMux.Handle("/", http.FileServer(http.Dir("/www")))
-	return server.ListenAndServe()
+	server := http09.Server{}
+
+	udpAddr, err := net.ResolveUDPAddr("udp", ":443")
+	if err != nil {
+		return err
+	}
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return err
+	}
+	tr := &quic.Transport{
+		Conn:                conn,
+		VerifySourceAddress: func(net.Addr) bool { return forceRetry },
+	}
+	ln, err := tr.ListenEarly(tlsConf, quicConf)
+	if err != nil {
+		return err
+	}
+	return server.ServeListener(ln)
 }
 
-func runHTTP3Server(quicConf *quic.Config) error {
+func runHTTP3Server(tlsConf *tls.Config, quicConf *quic.Config) error {
 	server := http3.Server{
-		Server: &http.Server{
-			Addr:      ":443",
-			TLSConfig: tlsConf,
-		},
-		QuicConfig: quicConf,
+		Addr:       ":443",
+		TLSConfig:  tlsConf,
+		QUICConfig: quicConf,
 	}
 	http.DefaultServeMux.Handle("/", http.FileServer(http.Dir("/www")))
 	return server.ListenAndServe()

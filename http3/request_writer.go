@@ -2,20 +2,24 @@ package http3
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strconv"
 	"strings"
 	"sync"
 
-	"github.com/lucas-clemente/quic-go"
-	"github.com/lucas-clemente/quic-go/internal/utils"
-	"github.com/marten-seemann/qpack"
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2/hpack"
 	"golang.org/x/net/idna"
+
+	"github.com/quic-go/qpack"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
 )
 
 const bodyCopyBufferSize = 8 * 1024
@@ -24,117 +28,104 @@ type requestWriter struct {
 	mutex     sync.Mutex
 	encoder   *qpack.Encoder
 	headerBuf *bytes.Buffer
-
-	logger utils.Logger
 }
 
-func newRequestWriter(logger utils.Logger) *requestWriter {
+func newRequestWriter() *requestWriter {
 	headerBuf := &bytes.Buffer{}
 	encoder := qpack.NewEncoder(headerBuf)
 	return &requestWriter{
 		encoder:   encoder,
 		headerBuf: headerBuf,
-		logger:    logger,
 	}
 }
 
-func (w *requestWriter) WriteRequest(str quic.Stream, req *http.Request, gzip bool) error {
+func (w *requestWriter) WriteRequestHeader(wr io.Writer, req *http.Request, gzip bool, streamID quic.StreamID, qlogger qlogwriter.Recorder) error {
 	buf := &bytes.Buffer{}
-	if err := w.writeHeaders(buf, req, gzip); err != nil {
+	if err := w.writeHeaders(buf, req, gzip, streamID, qlogger); err != nil {
 		return err
 	}
-	if _, err := str.Write(buf.Bytes()); err != nil {
-		return err
-	}
-	// TODO: add support for trailers
-	if req.Body == nil {
-		str.Close()
-		return nil
-	}
-
-	// send the request body asynchronously
-	go func() {
-		defer req.Body.Close()
-		b := make([]byte, bodyCopyBufferSize)
-		for {
-			n, rerr := req.Body.Read(b)
-			if n == 0 {
-				if rerr == nil {
-					continue
-				} else if rerr == io.EOF {
-					break
-				}
-			}
-			buf := &bytes.Buffer{}
-			(&dataFrame{Length: uint64(n)}).Write(buf)
-			if _, err := str.Write(buf.Bytes()); err != nil {
-				w.logger.Errorf("Error writing request: %s", err)
-				return
-			}
-			if _, err := str.Write(b[:n]); err != nil {
-				w.logger.Errorf("Error writing request: %s", err)
-				return
-			}
-			if rerr != nil {
-				if rerr == io.EOF {
-					break
-				}
-				str.CancelWrite(quic.StreamErrorCode(errorRequestCanceled))
-				w.logger.Errorf("Error writing request: %s", rerr)
-				return
-			}
-		}
-		str.Close()
-	}()
-
-	return nil
-}
-
-func (w *requestWriter) writeHeaders(wr io.Writer, req *http.Request, gzip bool) error {
-	w.mutex.Lock()
-	defer w.mutex.Unlock()
-	defer w.encoder.Close()
-
-	if err := w.encodeHeaders(req, gzip, "", actualContentLength(req)); err != nil {
-		return err
-	}
-
-	buf := &bytes.Buffer{}
-	hf := headersFrame{Length: uint64(w.headerBuf.Len())}
-	hf.Write(buf)
 	if _, err := wr.Write(buf.Bytes()); err != nil {
 		return err
 	}
-	if _, err := wr.Write(w.headerBuf.Bytes()); err != nil {
-		return err
-	}
-	w.headerBuf.Reset()
+	trace := httptrace.ContextClientTrace(req.Context())
+	traceWroteHeaders(trace)
 	return nil
 }
 
-// copied from net/transport.go
+func (w *requestWriter) writeHeaders(wr io.Writer, req *http.Request, gzip bool, streamID quic.StreamID, qlogger qlogwriter.Recorder) error {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	defer w.encoder.Close()
+	defer w.headerBuf.Reset()
 
-func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, trailers string, contentLength int64) error {
+	var trailers string
+	if len(req.Trailer) > 0 {
+		keys := make([]string, 0, len(req.Trailer))
+		for k := range req.Trailer {
+			if httpguts.ValidTrailerHeader(k) {
+				keys = append(keys, k)
+			}
+		}
+		trailers = strings.Join(keys, ", ")
+	}
+
+	headerFields, err := w.encodeHeaders(req, gzip, trailers, actualContentLength(req), qlogger != nil)
+	if err != nil {
+		return err
+	}
+
+	b := make([]byte, 0, 128)
+	b = (&headersFrame{Length: uint64(w.headerBuf.Len())}).Append(b)
+	if qlogger != nil {
+		qlogCreatedHeadersFrame(qlogger, streamID, len(b)+w.headerBuf.Len(), w.headerBuf.Len(), headerFields)
+	}
+	if _, err := wr.Write(b); err != nil {
+		return err
+	}
+	_, err = wr.Write(w.headerBuf.Bytes())
+	return err
+}
+
+func isExtendedConnectRequest(req *http.Request) bool {
+	return req.Method == http.MethodConnect && req.Proto != "" && req.Proto != "HTTP/1.1"
+}
+
+// copied from net/transport.go
+// Modified to support Extended CONNECT:
+// Contrary to what the godoc for the http.Request says,
+// we do respect the Proto field if the method is CONNECT.
+//
+// The returned header fields are only set if doQlog is true.
+func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, trailers string, contentLength int64, doQlog bool) ([]qlog.HeaderField, error) {
 	host := req.Host
 	if host == "" {
 		host = req.URL.Host
 	}
 	host, err := httpguts.PunycodeHostPort(host)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if !httpguts.ValidHostHeader(host) {
+		return nil, errors.New("http3: invalid Host header")
+	}
+
+	// http.NewRequest sets this field to HTTP/1.1
+	isExtendedConnect := isExtendedConnectRequest(req)
+	if isExtendedConnect && !validExtendedConnectProtocol(req.Proto) {
+		return nil, fmt.Errorf("invalid request :protocol %q", req.Proto)
 	}
 
 	var path string
-	if req.Method != "CONNECT" {
+	if req.Method != http.MethodConnect || isExtendedConnect {
 		path = req.URL.RequestURI()
 		if !validPseudoPath(path) {
 			orig := path
 			path = strings.TrimPrefix(path, req.URL.Scheme+"://"+host)
 			if !validPseudoPath(path) {
 				if req.URL.Opaque != "" {
-					return fmt.Errorf("invalid request :path %q from URL.Opaque = %q", orig, req.URL.Opaque)
+					return nil, fmt.Errorf("invalid request :path %q from URL.Opaque = %q", orig, req.URL.Opaque)
 				} else {
-					return fmt.Errorf("invalid request :path %q", orig)
+					return nil, fmt.Errorf("invalid request :path %q", orig)
 				}
 			}
 		}
@@ -145,11 +136,11 @@ func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, tra
 	// continue to reuse the hpack encoder for future requests)
 	for k, vv := range req.Header {
 		if !httpguts.ValidHeaderFieldName(k) {
-			return fmt.Errorf("invalid HTTP header name %q", k)
+			return nil, fmt.Errorf("invalid HTTP header name %q", k)
 		}
 		for _, v := range vv {
 			if !httpguts.ValidHeaderFieldValue(v) {
-				return fmt.Errorf("invalid HTTP header value %q for header %q", v, k)
+				return nil, fmt.Errorf("invalid HTTP header value for header %q", k)
 			}
 		}
 	}
@@ -162,9 +153,12 @@ func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, tra
 		// [RFC3986]).
 		f(":authority", host)
 		f(":method", req.Method)
-		if req.Method != "CONNECT" {
+		if req.Method != http.MethodConnect || isExtendedConnect {
 			f(":path", path)
 			f(":scheme", req.URL.Scheme)
+		}
+		if isExtendedConnect {
+			f(":protocol", req.Proto)
 		}
 		if trailers != "" {
 			f("trailer", trailers)
@@ -230,30 +224,34 @@ func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, tra
 	// 	return errRequestHeaderListSize
 	// }
 
-	// trace := httptrace.ContextClientTrace(req.Context())
-	// traceHeaders := traceHasWroteHeaderField(trace)
+	trace := httptrace.ContextClientTrace(req.Context())
+	traceHeaders := traceHasWroteHeaderField(trace)
 
 	// Header list size is ok. Write the headers.
+	var headerFields []qlog.HeaderField
+	if doQlog {
+		headerFields = make([]qlog.HeaderField, 0, len(req.Header))
+	}
 	enumerateHeaders(func(name, value string) {
 		name = strings.ToLower(name)
 		w.encoder.WriteField(qpack.HeaderField{Name: name, Value: value})
-		// if traceHeaders {
-		// 	traceWroteHeaderField(trace, name, value)
-		// }
+		if traceHeaders {
+			traceWroteHeaderField(trace, name, value)
+		}
+		if doQlog {
+			headerFields = append(headerFields, qlog.HeaderField{Name: name, Value: value})
+		}
 	})
 
-	return nil
+	return headerFields, nil
 }
 
 // authorityAddr returns a given authority (a host/IP, or host:port / ip:port)
 // and returns a host:port. The port 443 is added if needed.
-func authorityAddr(scheme string, authority string) (addr string) {
+func authorityAddr(authority string) (addr string) {
 	host, port, err := net.SplitHostPort(authority)
 	if err != nil { // authority didn't have a port
 		port = "443"
-		if scheme == "http" {
-			port = "80"
-		}
 		host = authority
 	}
 	if a, err := idna.ToASCII(host); err == nil {
@@ -269,8 +267,8 @@ func authorityAddr(scheme string, authority string) (addr string) {
 // validPseudoPath reports whether v is a valid :path pseudo-header
 // value. It must be either:
 //
-//     *) a non-empty string starting with '/'
-//     *) the string '*', for OPTIONS requests.
+//	*) a non-empty string starting with '/'
+//	*) the string '*', for OPTIONS requests.
 //
 // For now this is only used a quick check for deciding when to clean
 // up Opaque URLs before sending requests from the Transport.
@@ -287,7 +285,7 @@ func validPseudoPath(v string) bool {
 // req.ContentLength, where 0 actually means zero (not unknown) and -1
 // means unknown.
 func actualContentLength(req *http.Request) int64 {
-	if req.Body == nil {
+	if req.Body == nil || req.Body == http.NoBody {
 		return 0
 	}
 	if req.ContentLength != 0 {
@@ -316,4 +314,11 @@ func shouldSendReqContentLength(method string, contentLength int64) bool {
 	default:
 		return false
 	}
+}
+
+// WriteRequestTrailer writes HTTP trailers to the stream.
+// It should be called after the request body has been fully written.
+func (w *requestWriter) WriteRequestTrailer(wr io.Writer, req *http.Request, streamID quic.StreamID, qlogger qlogwriter.Recorder) error {
+	_, err := writeTrailers(wr, req.Trailer, streamID, qlogger)
+	return err
 }

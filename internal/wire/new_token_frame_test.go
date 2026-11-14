@@ -1,66 +1,51 @@
 package wire
 
 import (
-	"bytes"
+	"io"
+	"testing"
 
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/quicvarint"
+	"github.com/quic-go/quic-go/internal/protocol"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("NEW_TOKEN frame", func() {
-	Context("parsing", func() {
-		It("accepts a sample frame", func() {
-			token := "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
-			data := []byte{0x7}
-			data = append(data, encodeVarInt(uint64(len(token)))...)
-			data = append(data, token...)
-			b := bytes.NewReader(data)
-			f, err := parseNewTokenFrame(b, protocol.VersionWhatever)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(string(f.Token)).To(Equal(token))
-			Expect(b.Len()).To(BeZero())
-		})
+func TestParseNewTokenFrame(t *testing.T) {
+	token := "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+	data := encodeVarInt(uint64(len(token)))
+	data = append(data, token...)
+	f, l, err := parseNewTokenFrame(data, protocol.Version1)
+	require.NoError(t, err)
+	require.Equal(t, token, string(f.Token))
+	require.Equal(t, len(data), l)
+}
 
-		It("rejects empty tokens", func() {
-			data := []byte{0x7}
-			data = append(data, encodeVarInt(uint64(0))...)
-			b := bytes.NewReader(data)
-			_, err := parseNewTokenFrame(b, protocol.VersionWhatever)
-			Expect(err).To(MatchError("token must not be empty"))
-		})
+func TestParseNewTokenFrameRejectsEmptyTokens(t *testing.T) {
+	data := encodeVarInt(0)
+	_, _, err := parseNewTokenFrame(data, protocol.Version1)
+	require.EqualError(t, err, "token must not be empty")
+}
 
-		It("errors on EOFs", func() {
-			token := "Lorem ipsum dolor sit amet, consectetur adipiscing elit"
-			data := []byte{0x7}
-			data = append(data, encodeVarInt(uint64(len(token)))...)
-			data = append(data, token...)
-			_, err := parseNewTokenFrame(bytes.NewReader(data), protocol.VersionWhatever)
-			Expect(err).NotTo(HaveOccurred())
-			for i := range data {
-				_, err := parseNewTokenFrame(bytes.NewReader(data[0:i]), protocol.VersionWhatever)
-				Expect(err).To(HaveOccurred())
-			}
-		})
-	})
+func TestParseNewTokenFrameErrorsOnEOFs(t *testing.T) {
+	token := "Lorem ipsum dolor sit amet, consectetur adipiscing elit"
+	data := encodeVarInt(uint64(len(token)))
+	data = append(data, token...)
+	_, l, err := parseNewTokenFrame(data, protocol.Version1)
+	require.NoError(t, err)
+	require.Equal(t, len(data), l)
+	for i := range data {
+		_, _, err := parseNewTokenFrame(data[:i], protocol.Version1)
+		require.ErrorIs(t, err, io.EOF)
+	}
+}
 
-	Context("writing", func() {
-		It("writes a sample frame", func() {
-			token := "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat."
-			f := &NewTokenFrame{Token: []byte(token)}
-			b := &bytes.Buffer{}
-			Expect(f.Write(b, protocol.VersionWhatever)).To(Succeed())
-			expected := []byte{0x7}
-			expected = append(expected, encodeVarInt(uint64(len(token)))...)
-			expected = append(expected, token...)
-			Expect(b.Bytes()).To(Equal(expected))
-		})
-
-		It("has the correct min length", func() {
-			frame := &NewTokenFrame{Token: []byte("foobar")}
-			Expect(frame.Length(protocol.VersionWhatever)).To(Equal(1 + quicvarint.Len(6) + 6))
-		})
-	})
-})
+func TestWriteNewTokenFrame(t *testing.T) {
+	token := "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat."
+	f := &NewTokenFrame{Token: []byte(token)}
+	b, err := f.Append(nil, protocol.Version1)
+	require.NoError(t, err)
+	expected := []byte{byte(FrameTypeNewToken)}
+	expected = append(expected, encodeVarInt(uint64(len(token)))...)
+	expected = append(expected, token...)
+	require.Equal(t, expected, b)
+	require.Equal(t, len(b), int(f.Length(protocol.Version1)))
+}

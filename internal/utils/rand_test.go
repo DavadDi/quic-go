@@ -1,32 +1,35 @@
 package utils
 
 import (
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"math"
+	"strconv"
+	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("Rand", func() {
-	It("generates random numbers", func() {
-		const (
-			num = 1000
-			max = 123456
-		)
+func TestRandomNumbers(t *testing.T) {
+	const num = 1000
 
-		var values [num]int32
-		var r Rand
-		for i := 0; i < num; i++ {
-			v := r.Int31n(max)
-			Expect(v).To(And(
-				BeNumerically(">=", 0),
-				BeNumerically("<", max),
-			))
-			values[i] = v
-		}
+	var r Rand
+	require.Panics(t, func() { r.Uint32N(0) })
+	for _, max := range []uint32{1, 256, 12345678, 1<<31 + 1, math.MaxUint32} {
+		t.Run(strconv.FormatUint(uint64(max), 10), func(t *testing.T) {
+			var values [num]uint32
+			for i := range num {
+				v := r.Uint32N(max)
+				require.Less(t, v, max)
+				values[i] = v
+			}
 
-		var sum uint64
-		for _, n := range values {
-			sum += uint64(n)
-		}
-		Expect(float64(sum) / num).To(BeNumerically("~", max/2, max/25))
-	})
-})
+			var sum uint64
+			for _, n := range values {
+				sum += uint64(n)
+			}
+			average := float64(sum) / num
+			expectedAverage := (float64(max) - 1) / 2
+			tolerance := float64(max) / 25
+			require.InDelta(t, expectedAverage, average, tolerance)
+		})
+	}
+}

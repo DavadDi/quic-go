@@ -1,364 +1,572 @@
 package quic
 
 import (
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/internal/qerr"
-	"github.com/lucas-clemente/quic-go/internal/wire"
+	"crypto/rand"
+	"testing"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/qerr"
+	"github.com/quic-go/quic-go/internal/wire"
+
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("Connection ID Manager", func() {
-	var (
-		m             *connIDManager
-		frameQueue    []wire.Frame
-		tokenAdded    *protocol.StatelessResetToken
-		removedTokens []protocol.StatelessResetToken
+func TestConnIDManagerInitialConnID(t *testing.T) {
+	m := newConnIDManager(protocol.ParseConnectionID([]byte{1, 2, 3, 4}), nil, nil, nil)
+	require.Equal(t, protocol.ParseConnectionID([]byte{1, 2, 3, 4}), m.Get())
+	require.Equal(t, protocol.ParseConnectionID([]byte{1, 2, 3, 4}), m.Get())
+	m.ChangeInitialConnID(protocol.ParseConnectionID([]byte{5, 6, 7, 8}))
+	require.Equal(t, protocol.ParseConnectionID([]byte{5, 6, 7, 8}), m.Get())
+}
+
+func TestConnIDManagerAddConnIDs(t *testing.T) {
+	m := newConnIDManager(
+		protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
+		func(protocol.StatelessResetToken) {},
+		func(protocol.StatelessResetToken) {},
+		func(wire.Frame) {},
 	)
-	initialConnID := protocol.ConnectionID{0, 0, 0, 0}
+	f1 := &wire.NewConnectionIDFrame{
+		SequenceNumber:      1,
+		ConnectionID:        protocol.ParseConnectionID([]byte{0xde, 0xad, 0xbe, 0xef}),
+		StatelessResetToken: protocol.StatelessResetToken{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe},
+	}
+	f2 := &wire.NewConnectionIDFrame{
+		SequenceNumber:      2,
+		ConnectionID:        protocol.ParseConnectionID([]byte{0xba, 0xad, 0xf0, 0x0d}),
+		StatelessResetToken: protocol.StatelessResetToken{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe},
+	}
+	require.NoError(t, m.Add(f2))
+	require.NoError(t, m.Add(f1)) // receiving reordered frames is fine
+	require.NoError(t, m.Add(f2)) // receiving a duplicate is fine
 
-	BeforeEach(func() {
-		frameQueue = nil
-		tokenAdded = nil
-		removedTokens = nil
-		m = newConnIDManager(
-			initialConnID,
-			func(token protocol.StatelessResetToken) { tokenAdded = &token },
-			func(token protocol.StatelessResetToken) { removedTokens = append(removedTokens, token) },
-			func(f wire.Frame,
-			) {
-				frameQueue = append(frameQueue, f)
-			})
-	})
+	require.Equal(t, protocol.ParseConnectionID([]byte{1, 2, 3, 4}), m.Get())
+	m.updateConnectionID()
+	require.Equal(t, protocol.ParseConnectionID([]byte{0xde, 0xad, 0xbe, 0xef}), m.Get())
+	m.updateConnectionID()
+	require.Equal(t, protocol.ParseConnectionID([]byte{0xba, 0xad, 0xf0, 0x0d}), m.Get())
 
-	get := func() (protocol.ConnectionID, protocol.StatelessResetToken) {
-		if m.queue.Len() == 0 {
-			return nil, protocol.StatelessResetToken{}
-		}
-		val := m.queue.Remove(m.queue.Front())
-		return val.ConnectionID, val.StatelessResetToken
+	require.NoError(t, m.Add(f2)) // receiving a duplicate for the current connection ID is fine as well
+	require.Equal(t, protocol.ParseConnectionID([]byte{0xba, 0xad, 0xf0, 0x0d}), m.Get())
+
+	// receiving mismatching connection IDs is not fine
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber:      3,
+		ConnectionID:        protocol.ParseConnectionID([]byte{1, 2, 3, 4}), // mismatching connection ID
+		StatelessResetToken: protocol.StatelessResetToken{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe},
+	}))
+	require.EqualError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber:      3,
+		ConnectionID:        protocol.ParseConnectionID([]byte{2, 3, 4, 5}), // mismatching connection ID
+		StatelessResetToken: protocol.StatelessResetToken{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe},
+	}), "received conflicting connection IDs for sequence number 3")
+	// receiving mismatching stateless reset tokens is not fine either
+	require.EqualError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber:      3,
+		ConnectionID:        protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
+		StatelessResetToken: protocol.StatelessResetToken{1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe, 0},
+	}), "received conflicting stateless reset tokens for sequence number 3")
+}
+
+func TestConnIDManagerLimit(t *testing.T) {
+	m := newConnIDManager(
+		protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
+		func(protocol.StatelessResetToken) {},
+		func(protocol.StatelessResetToken) {},
+		func(f wire.Frame) {},
+	)
+	for i := uint8(1); i < protocol.MaxActiveConnectionIDs; i++ {
+		require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+			SequenceNumber:      uint64(i),
+			ConnectionID:        protocol.ParseConnectionID([]byte{i, i, i, i}),
+			StatelessResetToken: protocol.StatelessResetToken{i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i},
+		}))
+	}
+	require.ErrorIs(t,
+		m.Add(&wire.NewConnectionIDFrame{
+			SequenceNumber:      uint64(9999),
+			ConnectionID:        protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
+			StatelessResetToken: protocol.StatelessResetToken{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		}),
+		&qerr.TransportError{ErrorCode: qerr.ConnectionIDLimitError},
+	)
+}
+
+func TestConnIDManagerRetiringConnectionIDs(t *testing.T) {
+	var frameQueue []wire.Frame
+	m := newConnIDManager(
+		protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
+		func(protocol.StatelessResetToken) {},
+		func(protocol.StatelessResetToken) {},
+		func(f wire.Frame) { frameQueue = append(frameQueue, f) },
+	)
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber: 10,
+		ConnectionID:   protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
+	}))
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber: 13,
+		ConnectionID:   protocol.ParseConnectionID([]byte{2, 3, 4, 5}),
+	}))
+	require.Empty(t, frameQueue)
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+		RetirePriorTo:  14,
+		SequenceNumber: 17,
+		ConnectionID:   protocol.ParseConnectionID([]byte{3, 4, 5, 6}),
+	}))
+	require.Equal(t, []wire.Frame{
+		&wire.RetireConnectionIDFrame{SequenceNumber: 10},
+		&wire.RetireConnectionIDFrame{SequenceNumber: 13},
+		&wire.RetireConnectionIDFrame{SequenceNumber: 0},
+	}, frameQueue)
+	require.Equal(t, protocol.ParseConnectionID([]byte{3, 4, 5, 6}), m.Get())
+	frameQueue = nil
+
+	// a reordered connection ID is immediately retired
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber: 12,
+		ConnectionID:   protocol.ParseConnectionID([]byte{5, 6, 7, 8}),
+	}))
+	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 12}}, frameQueue)
+	require.Equal(t, protocol.ParseConnectionID([]byte{3, 4, 5, 6}), m.Get())
+}
+
+func TestConnIDManagerHandshakeCompletion(t *testing.T) {
+	var frameQueue []wire.Frame
+	var addedTokens, removedTokens []protocol.StatelessResetToken
+	m := newConnIDManager(
+		protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
+		func(token protocol.StatelessResetToken) { addedTokens = append(addedTokens, token) },
+		func(token protocol.StatelessResetToken) { removedTokens = append(removedTokens, token) },
+		func(f wire.Frame) { frameQueue = append(frameQueue, f) },
+	)
+	m.SetStatelessResetToken(protocol.StatelessResetToken{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1})
+	require.Equal(t, []protocol.StatelessResetToken{{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}}, addedTokens)
+	require.Empty(t, removedTokens)
+
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber:      1,
+		ConnectionID:        protocol.ParseConnectionID([]byte{4, 3, 2, 1}),
+		StatelessResetToken: protocol.StatelessResetToken{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
+	}))
+	require.Equal(t, protocol.ParseConnectionID([]byte{1, 2, 3, 4}), m.Get())
+	m.SetHandshakeComplete()
+	require.Equal(t, protocol.ParseConnectionID([]byte{4, 3, 2, 1}), m.Get())
+	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 0}}, frameQueue)
+	require.Equal(t, []protocol.StatelessResetToken{{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}}, removedTokens)
+}
+
+func TestConnIDManagerConnIDRotation(t *testing.T) {
+	toToken := func(connID protocol.ConnectionID) protocol.StatelessResetToken {
+		var token protocol.StatelessResetToken
+		copy(token[:], connID.Bytes())
+		copy(token[connID.Len():], connID.Bytes())
+		return token
 	}
 
-	It("returns the initial connection ID", func() {
-		Expect(m.Get()).To(Equal(initialConnID))
-	})
+	var frameQueue []wire.Frame
+	var addedTokens, removedTokens []protocol.StatelessResetToken
+	m := newConnIDManager(
+		protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
+		func(token protocol.StatelessResetToken) { addedTokens = append(addedTokens, token) },
+		func(token protocol.StatelessResetToken) { removedTokens = append(removedTokens, token) },
+		func(f wire.Frame) { frameQueue = append(frameQueue, f) },
+	)
+	// the first connection ID is used as soon as the handshake is complete
+	m.SetHandshakeComplete()
+	firstConnID := protocol.ParseConnectionID([]byte{4, 3, 2, 1})
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber:      1,
+		ConnectionID:        firstConnID,
+		StatelessResetToken: toToken(protocol.ParseConnectionID([]byte{4, 3, 2, 1})),
+	}))
+	require.Equal(t, firstConnID, m.Get())
+	frameQueue = nil
+	require.True(t, m.IsActiveStatelessResetToken(toToken(firstConnID)))
+	require.Equal(t, addedTokens, []protocol.StatelessResetToken{toToken(firstConnID)})
+	addedTokens = addedTokens[:0]
 
-	It("changes the initial connection ID", func() {
-		m.ChangeInitialConnID(protocol.ConnectionID{1, 2, 3, 4, 5})
-		Expect(m.Get()).To(Equal(protocol.ConnectionID{1, 2, 3, 4, 5}))
-	})
+	// Note that we're missing the connection ID with sequence number 2.
+	// It will be received later.
+	var queuedConnIDs []protocol.ConnectionID
+	for i := range protocol.MaxActiveConnectionIDs - 1 {
+		b := make([]byte, 4)
+		rand.Read(b)
+		connID := protocol.ParseConnectionID(b)
+		queuedConnIDs = append(queuedConnIDs, connID)
+		require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+			SequenceNumber:      uint64(3 + i),
+			ConnectionID:        connID,
+			StatelessResetToken: toToken(connID),
+		}))
+		require.False(t, m.IsActiveStatelessResetToken(toToken(connID)))
+	}
 
-	It("sets the token for the first connection ID", func() {
-		token := protocol.StatelessResetToken{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-		m.SetStatelessResetToken(token)
-		Expect(*m.activeStatelessResetToken).To(Equal(token))
-		Expect(*tokenAdded).To(Equal(token))
-	})
-
-	It("adds and gets connection IDs", func() {
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber:      10,
-			ConnectionID:        protocol.ConnectionID{2, 3, 4, 5},
-			StatelessResetToken: protocol.StatelessResetToken{0xe, 0xd, 0xc, 0xb, 0xa, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0},
-		})).To(Succeed())
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber:      4,
-			ConnectionID:        protocol.ConnectionID{1, 2, 3, 4},
-			StatelessResetToken: protocol.StatelessResetToken{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe},
-		})).To(Succeed())
-		c1, rt1 := get()
-		Expect(c1).To(Equal(protocol.ConnectionID{1, 2, 3, 4}))
-		Expect(rt1).To(Equal(protocol.StatelessResetToken{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe}))
-		c2, rt2 := get()
-		Expect(c2).To(Equal(protocol.ConnectionID{2, 3, 4, 5}))
-		Expect(rt2).To(Equal(protocol.StatelessResetToken{0xe, 0xd, 0xc, 0xb, 0xa, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0}))
-		c3, _ := get()
-		Expect(c3).To(BeNil())
-	})
-
-	It("accepts duplicates", func() {
-		f1 := &wire.NewConnectionIDFrame{
-			SequenceNumber:      1,
-			ConnectionID:        protocol.ConnectionID{1, 2, 3, 4},
-			StatelessResetToken: protocol.StatelessResetToken{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe},
+	var counter int
+	for {
+		require.Empty(t, frameQueue)
+		m.SentPacket()
+		counter++
+		if connID := m.Get(); connID != firstConnID {
+			require.Equal(t, queuedConnIDs[0], m.Get())
+			require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 1}}, frameQueue)
+			require.Equal(t, removedTokens, []protocol.StatelessResetToken{toToken(firstConnID)})
+			require.Equal(t, addedTokens, []protocol.StatelessResetToken{toToken(connID)})
+			addedTokens = addedTokens[:0]
+			removedTokens = removedTokens[:0]
+			require.True(t, m.IsActiveStatelessResetToken(toToken(connID)))
+			require.False(t, m.IsActiveStatelessResetToken(toToken(firstConnID)))
+			break
 		}
-		f2 := &wire.NewConnectionIDFrame{
-			SequenceNumber:      1,
-			ConnectionID:        protocol.ConnectionID{1, 2, 3, 4},
-			StatelessResetToken: protocol.StatelessResetToken{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe},
+		require.True(t, m.IsActiveStatelessResetToken(toToken(firstConnID)))
+		require.Empty(t, addedTokens)
+	}
+	require.GreaterOrEqual(t, counter, protocol.PacketsPerConnectionID/2)
+	require.LessOrEqual(t, counter, protocol.PacketsPerConnectionID*3/2)
+	frameQueue = nil
+
+	// now receive connection ID 2
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber: 2,
+		ConnectionID:   protocol.ParseConnectionID([]byte{2, 3, 4, 5}),
+	}))
+	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 2}}, frameQueue)
+}
+
+func TestConnIDManagerPathMigration(t *testing.T) {
+	var frameQueue []wire.Frame
+	var addedTokens, removedTokens []protocol.StatelessResetToken
+	m := newConnIDManager(
+		protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
+		func(token protocol.StatelessResetToken) { addedTokens = append(addedTokens, token) },
+		func(token protocol.StatelessResetToken) { removedTokens = append(removedTokens, token) },
+		func(f wire.Frame) { frameQueue = append(frameQueue, f) },
+	)
+
+	// no connection ID available yet
+	_, ok := m.GetConnIDForPath(1)
+	require.False(t, ok)
+
+	// add two connection IDs
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber:      1,
+		ConnectionID:        protocol.ParseConnectionID([]byte{4, 3, 2, 1}),
+		StatelessResetToken: protocol.StatelessResetToken{4, 3, 2, 1, 4, 3, 2, 1},
+	}))
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber:      2,
+		ConnectionID:        protocol.ParseConnectionID([]byte{5, 4, 3, 2}),
+		StatelessResetToken: protocol.StatelessResetToken{5, 4, 3, 2, 5, 4, 3, 2},
+	}))
+	connID, ok := m.GetConnIDForPath(1)
+	require.True(t, ok)
+	require.Equal(t, protocol.ParseConnectionID([]byte{4, 3, 2, 1}), connID)
+	require.Equal(t, []protocol.StatelessResetToken{{4, 3, 2, 1, 4, 3, 2, 1}}, addedTokens)
+	require.Empty(t, removedTokens)
+
+	addedTokens = addedTokens[:0]
+	require.False(t, m.IsActiveStatelessResetToken(protocol.StatelessResetToken{5, 4, 3, 2, 5, 4, 3, 2}))
+	connID, ok = m.GetConnIDForPath(2)
+	require.True(t, ok)
+	require.Equal(t, protocol.ParseConnectionID([]byte{5, 4, 3, 2}), connID)
+	require.Equal(t, []protocol.StatelessResetToken{{5, 4, 3, 2, 5, 4, 3, 2}}, addedTokens)
+	require.Empty(t, removedTokens)
+	require.True(t, m.IsActiveStatelessResetToken(protocol.StatelessResetToken{5, 4, 3, 2, 5, 4, 3, 2}))
+
+	addedTokens = addedTokens[:0]
+	// asking for the connection for path 1 again returns the same connection ID
+	connID, ok = m.GetConnIDForPath(1)
+	require.True(t, ok)
+	require.Equal(t, protocol.ParseConnectionID([]byte{4, 3, 2, 1}), connID)
+	require.Empty(t, addedTokens)
+
+	// if the connection ID is retired, the path will use another connection ID
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber:      3,
+		RetirePriorTo:       2,
+		ConnectionID:        protocol.ParseConnectionID([]byte{6, 5, 4, 3}),
+		StatelessResetToken: protocol.StatelessResetToken{6, 5, 4, 3, 6, 5, 4, 3},
+	}))
+	require.Len(t, frameQueue, 2)
+	require.Equal(t, []protocol.StatelessResetToken{{4, 3, 2, 1, 4, 3, 2, 1}}, removedTokens)
+	frameQueue = nil
+	removedTokens = removedTokens[:0]
+
+	require.Equal(t, protocol.ParseConnectionID([]byte{6, 5, 4, 3}), m.Get())
+	require.Equal(t, []protocol.StatelessResetToken{{6, 5, 4, 3, 6, 5, 4, 3}}, addedTokens)
+	require.Empty(t, removedTokens)
+	addedTokens = addedTokens[:0]
+
+	// the connection ID is not used for new paths
+	_, ok = m.GetConnIDForPath(3)
+	require.False(t, ok)
+
+	// Manually retiring the connection ID does nothing.
+	// Path 1 doesn't have a connection ID anymore.
+	m.RetireConnIDForPath(1)
+	require.Empty(t, frameQueue)
+	_, ok = m.GetConnIDForPath(1)
+	require.False(t, ok)
+	require.Empty(t, removedTokens)
+
+	// only after a new connection ID is added, it will be used for path 1
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber:      4,
+		ConnectionID:        protocol.ParseConnectionID([]byte{7, 6, 5, 4}),
+		StatelessResetToken: protocol.StatelessResetToken{16, 15, 14, 13},
+	}))
+	connID, ok = m.GetConnIDForPath(1)
+	require.True(t, ok)
+	require.Equal(t, protocol.ParseConnectionID([]byte{7, 6, 5, 4}), connID)
+	require.Equal(t, []protocol.StatelessResetToken{{16, 15, 14, 13}}, addedTokens)
+	require.Empty(t, removedTokens)
+	require.True(t, m.IsActiveStatelessResetToken(protocol.StatelessResetToken{16, 15, 14, 13}))
+
+	// a RETIRE_CONNECTION_ID frame for path 1 is queued when retiring the connection ID
+	m.RetireConnIDForPath(1)
+	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 4}}, frameQueue)
+	require.Equal(t, []protocol.StatelessResetToken{{16, 15, 14, 13}}, removedTokens)
+	removedTokens = removedTokens[:0]
+	require.False(t, m.IsActiveStatelessResetToken(protocol.StatelessResetToken{16, 15, 14, 13}))
+
+	frameQueue = nil
+	m.Close()
+	require.Equal(t, []protocol.StatelessResetToken{
+		{6, 5, 4, 3, 6, 5, 4, 3}, // currently active connection ID
+		{5, 4, 3, 2, 5, 4, 3, 2}, // path 2
+	}, removedTokens)
+	m.RetireConnIDForPath(2)
+	require.Empty(t, frameQueue)
+}
+
+func TestConnIDManagerRetirePriorToReordered(t *testing.T) {
+	var frameQueue []wire.Frame
+	m := newConnIDManager(
+		protocol.ParseConnectionID([]byte{0, 0, 0, 0}),
+		func(protocol.StatelessResetToken) {},
+		func(protocol.StatelessResetToken) {},
+		func(f wire.Frame) { frameQueue = append(frameQueue, f) },
+	)
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{SequenceNumber: 1, ConnectionID: protocol.ParseConnectionID([]byte{1, 1, 1, 1})}))
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{SequenceNumber: 3, ConnectionID: protocol.ParseConnectionID([]byte{3, 3, 3, 3})}))
+	// switch to connection ID 1 after the handshake, and probe a path using connection ID 3
+	m.SetHandshakeComplete()
+	require.Equal(t, protocol.ParseConnectionID([]byte{1, 1, 1, 1}), m.Get())
+	_, ok := m.GetConnIDForPath(1)
+	require.True(t, ok)
+	frameQueue = nil
+
+	// The peer retransmits the lost frame for connection ID 2, with an increased Retire Prior To.
+	// Connection ID 2 was skipped and is retired, so there's no connection ID to replace connection ID 1 yet.
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber: 2,
+		RetirePriorTo:  2,
+		ConnectionID:   protocol.ParseConnectionID([]byte{2, 2, 2, 2}),
+	}))
+	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 2}}, frameQueue)
+	require.Equal(t, protocol.ParseConnectionID([]byte{1, 1, 1, 1}), m.Get())
+	frameQueue = nil
+	// connection ID 1 is retired once the peer provides a new connection ID,
+	// even if that frame was sent before Retire Prior To was increased
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{SequenceNumber: 4, ConnectionID: protocol.ParseConnectionID([]byte{4, 4, 4, 4})}))
+	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 1}}, frameQueue)
+	require.Equal(t, protocol.ParseConnectionID([]byte{4, 4, 4, 4}), m.Get())
+}
+
+func TestConnIDManagerRetransmittedConnIDs(t *testing.T) {
+	var frameQueue []wire.Frame
+	m := newConnIDManager(
+		protocol.ParseConnectionID([]byte{0, 0, 0, 0}),
+		func(protocol.StatelessResetToken) {},
+		func(protocol.StatelessResetToken) {},
+		func(f wire.Frame) { frameQueue = append(frameQueue, f) },
+	)
+	f1 := &wire.NewConnectionIDFrame{SequenceNumber: 1, ConnectionID: protocol.ParseConnectionID([]byte{1, 1, 1, 1})}
+	f2 := &wire.NewConnectionIDFrame{SequenceNumber: 2, ConnectionID: protocol.ParseConnectionID([]byte{2, 2, 2, 2})}
+	f3 := &wire.NewConnectionIDFrame{SequenceNumber: 3, ConnectionID: protocol.ParseConnectionID([]byte{3, 3, 3, 3})}
+	for _, f := range []*wire.NewConnectionIDFrame{f1, f2, f3} {
+		require.NoError(t, m.Add(f))
+	}
+	// probe a path using connection ID 1, switch to connection ID 2, and probe another path using connection ID 3
+	_, ok := m.GetConnIDForPath(1)
+	require.True(t, ok)
+	m.SetHandshakeComplete()
+	require.Equal(t, protocol.ParseConnectionID([]byte{2, 2, 2, 2}), m.Get())
+	_, ok = m.GetConnIDForPath(2)
+	require.True(t, ok)
+	frameQueue = nil
+
+	// The active connection ID isn't retired, and the paths' connection IDs aren't queued again.
+	for _, f := range []*wire.NewConnectionIDFrame{f1, f2, f3} {
+		require.NoError(t, m.Add(f))
+	}
+	require.Empty(t, frameQueue)
+	require.Equal(t, protocol.ParseConnectionID([]byte{2, 2, 2, 2}), m.Get())
+	_, ok = m.GetConnIDForPath(3)
+	require.False(t, ok)
+
+	// the peer might have increased Retire Prior To since sending the original frame
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{SequenceNumber: 2, RetirePriorTo: 2, ConnectionID: f2.ConnectionID}))
+	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 1}}, frameQueue)
+	frameQueue = nil
+	// the active connection ID is retired once the peer provides a new connection ID
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{SequenceNumber: 3, RetirePriorTo: 3, ConnectionID: f3.ConnectionID}))
+	require.Empty(t, frameQueue)
+	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber: 4,
+		RetirePriorTo:  3,
+		ConnectionID:   protocol.ParseConnectionID([]byte{4, 4, 4, 4}),
+	}))
+	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 2}}, frameQueue)
+	require.Equal(t, protocol.ParseConnectionID([]byte{4, 4, 4, 4}), m.Get())
+	frameQueue = nil
+
+	// once the path is closed, its connection ID is retired again instead of being queued
+	m.RetireConnIDForPath(2)
+	require.NoError(t, m.Add(f3))
+	require.Equal(t, []wire.Frame{
+		&wire.RetireConnectionIDFrame{SequenceNumber: 3},
+		&wire.RetireConnectionIDFrame{SequenceNumber: 3},
+	}, frameQueue)
+	_, ok = m.GetConnIDForPath(3)
+	require.False(t, ok)
+}
+
+func TestConnIDManagerSwitchToPath(t *testing.T) {
+	var frameQueue []wire.Frame
+	m := newConnIDManager(
+		protocol.ParseConnectionID([]byte{0, 0, 0, 0}),
+		func(protocol.StatelessResetToken) {},
+		func(protocol.StatelessResetToken) {},
+		func(f wire.Frame) { frameQueue = append(frameQueue, f) },
+	)
+	connID := func(seq uint8) protocol.ConnectionID { return protocol.ParseConnectionID([]byte{seq, seq, seq, seq}) }
+	newConnIDFrame := func(seq uint8) *wire.NewConnectionIDFrame {
+		return &wire.NewConnectionIDFrame{SequenceNumber: uint64(seq), ConnectionID: connID(seq)}
+	}
+	require.NoError(t, m.Add(newConnIDFrame(1)))
+	require.NoError(t, m.Add(newConnIDFrame(2)))
+	_, ok := m.GetConnIDForPath(2)
+	require.True(t, ok)
+
+	// Switching to a path without a connection ID, e.g. because the connection switched away from it before,
+	// uses a new connection ID. The previously active connection ID is retired.
+	m.SwitchToPath(1)
+	require.Equal(t, connID(2), m.Get())
+	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 0}}, frameQueue)
+	frameQueue = nil
+
+	// Switching to a probed path uses its connection ID.
+	// This moves the active connection ID backwards, from 2 to 1.
+	m.SwitchToPath(2)
+	require.Equal(t, connID(1), m.Get())
+	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 2}}, frameQueue)
+	frameQueue = nil
+	// a retransmission of connection ID 2 is retired again instead of being queued
+	require.NoError(t, m.Add(newConnIDFrame(2)))
+	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 2}}, frameQueue)
+	frameQueue = nil
+
+	// if the peer didn't provide a new connection ID, the active connection ID is kept
+	m.SwitchToPath(1)
+	require.Equal(t, connID(1), m.Get())
+	require.Empty(t, frameQueue)
+}
+
+func TestConnIDManagerZeroLengthConnectionID(t *testing.T) {
+	m := newConnIDManager(
+		protocol.ZeroLengthConnectionID,
+		func(protocol.StatelessResetToken) {},
+		func(protocol.StatelessResetToken) {},
+		func(f wire.Frame) {},
+	)
+	require.Equal(t, protocol.ZeroLengthConnectionID, m.Get())
+	for range 5 * protocol.PacketsPerConnectionID {
+		m.SentPacket()
+		require.Equal(t, protocol.ZeroLengthConnectionID, m.Get())
+	}
+
+	// for path probing, we don't need to change the connection ID
+	for id := pathID(1); id < 10; id++ {
+		connID, ok := m.GetConnIDForPath(id)
+		require.True(t, ok)
+		require.Equal(t, protocol.ZeroLengthConnectionID, connID)
+	}
+	// retiring a connection ID for a path is also a no-op
+	for id := pathID(1); id < 20; id++ {
+		m.RetireConnIDForPath(id)
+	}
+
+	require.ErrorIs(t, m.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber:      1,
+		ConnectionID:        protocol.ZeroLengthConnectionID,
+		StatelessResetToken: protocol.StatelessResetToken{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
+	}), &qerr.TransportError{ErrorCode: qerr.ProtocolViolation})
+}
+
+func TestConnIDManagerClose(t *testing.T) {
+	var addedTokens, removedTokens []protocol.StatelessResetToken
+	m := newConnIDManager(
+		protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
+		func(token protocol.StatelessResetToken) { addedTokens = append(addedTokens, token) },
+		func(token protocol.StatelessResetToken) { removedTokens = append(removedTokens, token) },
+		func(f wire.Frame) {},
+	)
+	m.SetStatelessResetToken(protocol.StatelessResetToken{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1})
+	require.Equal(t, []protocol.StatelessResetToken{{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}}, addedTokens)
+	require.Empty(t, removedTokens)
+	m.Close()
+	require.Equal(t, []protocol.StatelessResetToken{{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}}, removedTokens)
+
+	require.Panics(t, func() { m.Get() })
+	require.Panics(t, func() { m.SetStatelessResetToken(protocol.StatelessResetToken{}) })
+}
+
+func BenchmarkConnIDManagerReordered(b *testing.B) {
+	benchmarkConnIDManager(b, true)
+}
+
+func BenchmarkConnIDManagerInOrder(b *testing.B) {
+	benchmarkConnIDManager(b, false)
+}
+
+func benchmarkConnIDManager(b *testing.B, reordered bool) {
+	m := newConnIDManager(
+		protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
+		func(protocol.StatelessResetToken) {},
+		func(protocol.StatelessResetToken) {},
+		func(f wire.Frame) {},
+	)
+	connIDs := make([]protocol.ConnectionID, 0, protocol.MaxActiveConnectionIDs)
+	statelessResetTokens := make([]protocol.StatelessResetToken, 0, protocol.MaxActiveConnectionIDs)
+	for range protocol.MaxActiveConnectionIDs {
+		b := make([]byte, 8)
+		rand.Read(b)
+		connIDs = append(connIDs, protocol.ParseConnectionID(b))
+		var statelessResetToken protocol.StatelessResetToken
+		rand.Read(statelessResetToken[:])
+		statelessResetTokens = append(statelessResetTokens, statelessResetToken)
+	}
+
+	// 1 -> 3
+	// 2 -> 1
+	// 3 -> 2
+	// 4 -> 4
+	offsets := []int{2, -1, -1, 0}
+
+	b.ResetTimer()
+	for i := range b.N {
+		seq := i
+		if reordered {
+			seq += offsets[i%len(offsets)]
 		}
-		Expect(m.Add(f1)).To(Succeed())
-		Expect(m.Add(f2)).To(Succeed())
-		c1, rt1 := get()
-		Expect(c1).To(Equal(protocol.ConnectionID{1, 2, 3, 4}))
-		Expect(rt1).To(Equal(protocol.StatelessResetToken{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe}))
-		c2, _ := get()
-		Expect(c2).To(BeNil())
-	})
-
-	It("ignores duplicates for the currently used connection ID", func() {
-		f := &wire.NewConnectionIDFrame{
-			SequenceNumber:      1,
-			ConnectionID:        protocol.ConnectionID{1, 2, 3, 4},
-			StatelessResetToken: protocol.StatelessResetToken{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe},
+		m.Add(&wire.NewConnectionIDFrame{
+			SequenceNumber:      uint64(seq),
+			ConnectionID:        connIDs[i%len(connIDs)],
+			StatelessResetToken: statelessResetTokens[i%len(statelessResetTokens)],
+		})
+		if i > protocol.MaxActiveConnectionIDs-2 {
+			m.updateConnectionID()
 		}
-		m.SetHandshakeComplete()
-		Expect(m.Add(f)).To(Succeed())
-		Expect(m.Get()).To(Equal(protocol.ConnectionID{1, 2, 3, 4}))
-		c, _ := get()
-		Expect(c).To(BeNil())
-		// Now send the same connection ID again. It should not be queued.
-		Expect(m.Add(f)).To(Succeed())
-		c, _ = get()
-		Expect(c).To(BeNil())
-	})
-
-	It("rejects duplicates with different connection IDs", func() {
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber: 42,
-			ConnectionID:   protocol.ConnectionID{1, 2, 3, 4},
-		})).To(Succeed())
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber: 42,
-			ConnectionID:   protocol.ConnectionID{2, 3, 4, 5},
-		})).To(MatchError("received conflicting connection IDs for sequence number 42"))
-	})
-
-	It("rejects duplicates with different connection IDs", func() {
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber:      42,
-			ConnectionID:        protocol.ConnectionID{1, 2, 3, 4},
-			StatelessResetToken: protocol.StatelessResetToken{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe},
-		})).To(Succeed())
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber:      42,
-			ConnectionID:        protocol.ConnectionID{1, 2, 3, 4},
-			StatelessResetToken: protocol.StatelessResetToken{0xe, 0xd, 0xc, 0xb, 0xa, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0},
-		})).To(MatchError("received conflicting stateless reset tokens for sequence number 42"))
-	})
-
-	It("retires connection IDs", func() {
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber: 10,
-			ConnectionID:   protocol.ConnectionID{1, 2, 3, 4},
-		})).To(Succeed())
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber: 13,
-			ConnectionID:   protocol.ConnectionID{2, 3, 4, 5},
-		})).To(Succeed())
-		Expect(frameQueue).To(BeEmpty())
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			RetirePriorTo:  14,
-			SequenceNumber: 17,
-			ConnectionID:   protocol.ConnectionID{3, 4, 5, 6},
-		})).To(Succeed())
-		Expect(frameQueue).To(HaveLen(3))
-		Expect(frameQueue[0].(*wire.RetireConnectionIDFrame).SequenceNumber).To(BeEquivalentTo(10))
-		Expect(frameQueue[1].(*wire.RetireConnectionIDFrame).SequenceNumber).To(BeEquivalentTo(13))
-		Expect(frameQueue[2].(*wire.RetireConnectionIDFrame).SequenceNumber).To(BeZero())
-		Expect(m.Get()).To(Equal(protocol.ConnectionID{3, 4, 5, 6}))
-	})
-
-	It("ignores reordered connection IDs, if their sequence number was already retired", func() {
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber: 10,
-			ConnectionID:   protocol.ConnectionID{1, 2, 3, 4},
-			RetirePriorTo:  5,
-		})).To(Succeed())
-		Expect(frameQueue).To(HaveLen(1))
-		Expect(frameQueue[0].(*wire.RetireConnectionIDFrame).SequenceNumber).To(BeZero())
-		frameQueue = nil
-		// If this NEW_CONNECTION_ID frame hadn't been reordered, we would have retired it before.
-		// Make sure it gets retired immediately now.
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber: 4,
-			ConnectionID:   protocol.ConnectionID{4, 3, 2, 1},
-		})).To(Succeed())
-		Expect(frameQueue).To(HaveLen(1))
-		Expect(frameQueue[0].(*wire.RetireConnectionIDFrame).SequenceNumber).To(BeEquivalentTo(4))
-	})
-
-	It("ignores reordered connection IDs, if their sequence number was already retired or less than active", func() {
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber: 10,
-			ConnectionID:   protocol.ConnectionID{0xde, 0xad, 0xbe, 0xef},
-			RetirePriorTo:  5,
-		})).To(Succeed())
-		Expect(frameQueue).To(HaveLen(1))
-		Expect(frameQueue[0].(*wire.RetireConnectionIDFrame).SequenceNumber).To(BeZero())
-		frameQueue = nil
-		Expect(m.Get()).To(Equal(protocol.ConnectionID{0xde, 0xad, 0xbe, 0xef}))
-
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber: 9,
-			ConnectionID:   protocol.ConnectionID{0xde, 0xca, 0xfb, 0xad},
-			RetirePriorTo:  5,
-		})).To(Succeed())
-		Expect(frameQueue).To(HaveLen(1))
-		Expect(frameQueue[0].(*wire.RetireConnectionIDFrame).SequenceNumber).To(BeEquivalentTo(9))
-	})
-
-	It("accepts retransmissions for the connection ID that is in use", func() {
-		connID := protocol.ConnectionID{1, 2, 3, 4}
-
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber: 1,
-			ConnectionID:   connID,
-		})).To(Succeed())
-		m.SetHandshakeComplete()
-		Expect(frameQueue).To(BeEmpty())
-		Expect(m.Get()).To(Equal(connID))
-		Expect(frameQueue).To(HaveLen(1))
-		Expect(frameQueue[0]).To(BeAssignableToTypeOf(&wire.RetireConnectionIDFrame{}))
-		Expect(frameQueue[0].(*wire.RetireConnectionIDFrame).SequenceNumber).To(BeZero())
-		frameQueue = nil
-
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber: 1,
-			ConnectionID:   connID,
-		})).To(Succeed())
-		Expect(frameQueue).To(BeEmpty())
-	})
-
-	It("errors when the peer sends too connection IDs", func() {
-		for i := uint8(1); i < protocol.MaxActiveConnectionIDs; i++ {
-			Expect(m.Add(&wire.NewConnectionIDFrame{
-				SequenceNumber:      uint64(i),
-				ConnectionID:        protocol.ConnectionID{i, i, i, i},
-				StatelessResetToken: protocol.StatelessResetToken{i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i},
-			})).To(Succeed())
-		}
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber:      uint64(9999),
-			ConnectionID:        protocol.ConnectionID{1, 2, 3, 4},
-			StatelessResetToken: protocol.StatelessResetToken{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
-		})).To(MatchError(&qerr.TransportError{ErrorCode: qerr.ConnectionIDLimitError}))
-	})
-
-	It("initiates the first connection ID update as soon as possible", func() {
-		Expect(m.Get()).To(Equal(initialConnID))
-		m.SetHandshakeComplete()
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber:      1,
-			ConnectionID:        protocol.ConnectionID{1, 2, 3, 4},
-			StatelessResetToken: protocol.StatelessResetToken{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
-		})).To(Succeed())
-		Expect(m.Get()).To(Equal(protocol.ConnectionID{1, 2, 3, 4}))
-	})
-
-	It("waits until handshake completion before initiating a connection ID update", func() {
-		Expect(m.Get()).To(Equal(initialConnID))
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber:      1,
-			ConnectionID:        protocol.ConnectionID{1, 2, 3, 4},
-			StatelessResetToken: protocol.StatelessResetToken{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
-		})).To(Succeed())
-		Expect(m.Get()).To(Equal(initialConnID))
-		m.SetHandshakeComplete()
-		Expect(m.Get()).To(Equal(protocol.ConnectionID{1, 2, 3, 4}))
-	})
-
-	It("initiates subsequent updates when enough packets are sent", func() {
-		var s uint8
-		for s = uint8(1); s < protocol.MaxActiveConnectionIDs; s++ {
-			Expect(m.Add(&wire.NewConnectionIDFrame{
-				SequenceNumber:      uint64(s),
-				ConnectionID:        protocol.ConnectionID{s, s, s, s},
-				StatelessResetToken: protocol.StatelessResetToken{s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s},
-			})).To(Succeed())
-		}
-
-		m.SetHandshakeComplete()
-		lastConnID := m.Get()
-		Expect(lastConnID).To(Equal(protocol.ConnectionID{1, 1, 1, 1}))
-
-		var counter int
-		for i := 0; i < 50*protocol.PacketsPerConnectionID; i++ {
-			m.SentPacket()
-
-			connID := m.Get()
-			if !connID.Equal(lastConnID) {
-				counter++
-				lastConnID = connID
-				Expect(removedTokens).To(HaveLen(1))
-				removedTokens = nil
-				Expect(m.Add(&wire.NewConnectionIDFrame{
-					SequenceNumber:      uint64(s),
-					ConnectionID:        protocol.ConnectionID{s, s, s, s},
-					StatelessResetToken: protocol.StatelessResetToken{s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s},
-				})).To(Succeed())
-				s++
-			}
-		}
-		Expect(counter).To(BeNumerically("~", 50, 10))
-	})
-
-	It("retires delayed connection IDs that arrive after a higher connection ID was already retired", func() {
-		for s := uint8(10); s <= 10+protocol.MaxActiveConnectionIDs/2; s++ {
-			Expect(m.Add(&wire.NewConnectionIDFrame{
-				SequenceNumber:      uint64(s),
-				ConnectionID:        protocol.ConnectionID{s, s, s, s},
-				StatelessResetToken: protocol.StatelessResetToken{s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s},
-			})).To(Succeed())
-		}
-		m.SetHandshakeComplete()
-		Expect(m.Get()).To(Equal(protocol.ConnectionID{10, 10, 10, 10}))
-		for {
-			m.SentPacket()
-			if m.Get().Equal(protocol.ConnectionID{11, 11, 11, 11}) {
-				break
-			}
-		}
-		// The active conn ID is now {11, 11, 11, 11}
-		Expect(m.queue.Front().Value.ConnectionID).To(Equal(protocol.ConnectionID{12, 12, 12, 12}))
-		// Add a delayed connection ID. It should just be ignored now.
-		frameQueue = nil
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber:      uint64(5),
-			ConnectionID:        protocol.ConnectionID{5, 5, 5, 5},
-			StatelessResetToken: protocol.StatelessResetToken{5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5},
-		})).To(Succeed())
-		Expect(m.queue.Front().Value.ConnectionID).To(Equal(protocol.ConnectionID{12, 12, 12, 12}))
-		Expect(frameQueue).To(HaveLen(1))
-		Expect(frameQueue[0].(*wire.RetireConnectionIDFrame).SequenceNumber).To(BeEquivalentTo(5))
-	})
-
-	It("only initiates subsequent updates when enough if enough connection IDs are queued", func() {
-		for i := uint8(1); i <= protocol.MaxActiveConnectionIDs/2; i++ {
-			Expect(m.Add(&wire.NewConnectionIDFrame{
-				SequenceNumber:      uint64(i),
-				ConnectionID:        protocol.ConnectionID{i, i, i, i},
-				StatelessResetToken: protocol.StatelessResetToken{i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i},
-			})).To(Succeed())
-		}
-		m.SetHandshakeComplete()
-		Expect(m.Get()).To(Equal(protocol.ConnectionID{1, 1, 1, 1}))
-		for i := 0; i < 2*protocol.PacketsPerConnectionID; i++ {
-			m.SentPacket()
-		}
-		Expect(m.Get()).To(Equal(protocol.ConnectionID{1, 1, 1, 1}))
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber: 1337,
-			ConnectionID:   protocol.ConnectionID{1, 3, 3, 7},
-		})).To(Succeed())
-		Expect(m.Get()).To(Equal(protocol.ConnectionID{2, 2, 2, 2}))
-		Expect(removedTokens).To(HaveLen(1))
-		Expect(removedTokens[0]).To(Equal(protocol.StatelessResetToken{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}))
-	})
-
-	It("removes the currently active stateless reset token when it is closed", func() {
-		m.Close()
-		Expect(removedTokens).To(BeEmpty())
-		Expect(m.Add(&wire.NewConnectionIDFrame{
-			SequenceNumber:      1,
-			ConnectionID:        protocol.ConnectionID{1, 2, 3, 4},
-			StatelessResetToken: protocol.StatelessResetToken{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
-		})).To(Succeed())
-		m.SetHandshakeComplete()
-		Expect(m.Get()).To(Equal(protocol.ConnectionID{1, 2, 3, 4}))
-		m.Close()
-		Expect(removedTokens).To(HaveLen(1))
-		Expect(removedTokens[0]).To(Equal(protocol.StatelessResetToken{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}))
-	})
-})
+	}
+}

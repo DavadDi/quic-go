@@ -1,99 +1,105 @@
 package ackhandler
 
 import (
-	"fmt"
 	"math"
+	"testing"
 
-	"github.com/lucas-clemente/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/protocol"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("Sequential Packet Number Generator", func() {
-	It("generates sequential packet numbers", func() {
-		const initialPN protocol.PacketNumber = 123
-		png := newSequentialPacketNumberGenerator(initialPN)
+func TestPacketNumberGeneratorWithoutSkipping(t *testing.T) {
+	const initialPN protocol.PacketNumber = 123
+	png := newPacketNumberGenerator(initialPN, 1, 1)
 
-		for i := initialPN; i < initialPN+1000; i++ {
-			Expect(png.Peek()).To(Equal(i))
-			Expect(png.Peek()).To(Equal(i))
-			Expect(png.Pop()).To(Equal(i))
+	for i := initialPN; i < initialPN+1000; i++ {
+		require.Equal(t, i, png.Peek(false))
+		require.Equal(t, i, png.Peek(false))
+		skipNext, pn := png.Pop(false)
+		require.False(t, skipNext)
+		require.Equal(t, i, pn)
+	}
+	// Sending crypto packets doesn't consume the application-data skipping period.
+	var skipped bool
+	for range 6 {
+		didSkip, _ := png.Pop(true)
+		skipped = skipped || didSkip
+	}
+	require.True(t, skipped)
+}
+
+func TestSkippingPacketNumberGenerator(t *testing.T) {
+	// the maximum period must be sufficiently small such that using a 32-bit random number is ok
+	require.Less(t, uint64(2*skipPacketMaxPeriod), uint64(math.MaxUint32))
+
+	const initialPeriod = 25
+	const maxPeriod = 300
+
+	png := newPacketNumberGenerator(100, initialPeriod, maxPeriod)
+	require.Equal(t, protocol.PacketNumber(100), png.Peek(true))
+	require.Equal(t, protocol.PacketNumber(100), png.Peek(true))
+	require.Equal(t, protocol.PacketNumber(100), png.Peek(true))
+	_, pn := png.Pop(true)
+	require.Equal(t, protocol.PacketNumber(100), pn)
+
+	var last protocol.PacketNumber
+	var skipped bool
+	for i := range maxPeriod {
+		next := png.Peek(false)
+		didSkip, num := png.Pop(false)
+		require.False(t, didSkip)
+		require.Equal(t, next, num)
+		next = png.Peek(true)
+		didSkip, num = png.Pop(true)
+		require.Equal(t, next, num)
+		if didSkip {
+			skipped = true
+			_, nextNum := png.Pop(true)
+			require.Equal(t, num+1, nextNum)
+			break
 		}
-	})
-})
+		if i != 0 {
+			require.Equal(t, num, last+2)
+		}
+		last = num
+	}
+	require.True(t, skipped)
+}
 
-var _ = Describe("Skipping Packet Number Generator", func() {
+func TestSkippingPacketNumberGeneratorPeriods(t *testing.T) {
 	const initialPN protocol.PacketNumber = 8
-	const initialPeriod protocol.PacketNumber = 25
-	const maxPeriod protocol.PacketNumber = 300
+	const initialPeriod = 25
+	const maxPeriod = 300
 
-	It("uses a maximum period that is sufficiently small such that using a 32-bit random number is ok", func() {
-		Expect(2 * protocol.SkipPacketMaxPeriod).To(BeNumerically("<", math.MaxInt32))
-	})
+	const rep = 2500
+	periods := make([][]protocol.PacketNumber, rep)
+	expectedPeriods := []protocol.PacketNumber{25, 50, 100, 200, 300, 300, 300}
 
-	It("can be initialized to return any first packet number", func() {
-		png := newSkippingPacketNumberGenerator(12345, initialPeriod, maxPeriod)
-		Expect(png.Pop()).To(Equal(protocol.PacketNumber(12345)))
-	})
-
-	It("allows peeking", func() {
-		png := newSkippingPacketNumberGenerator(initialPN, initialPeriod, maxPeriod).(*skippingPacketNumberGenerator)
-		png.nextToSkip = 1000
-		Expect(png.Peek()).To(Equal(initialPN))
-		Expect(png.Peek()).To(Equal(initialPN))
-		Expect(png.Pop()).To(Equal(initialPN))
-		Expect(png.Peek()).To(Equal(initialPN + 1))
-		Expect(png.Peek()).To(Equal(initialPN + 1))
-	})
-
-	It("skips a packet number", func() {
-		png := newSkippingPacketNumberGenerator(initialPN, initialPeriod, maxPeriod)
-		var last protocol.PacketNumber
-		var skipped bool
-		for i := 0; i < 1000; i++ {
-			num := png.Pop()
-			if num > last+1 {
-				skipped = true
-				break
-			}
-			last = num
-		}
-		Expect(skipped).To(BeTrue())
-	})
-
-	It("generates a new packet number to skip", func() {
-		const rep = 2500
-		periods := make([][]protocol.PacketNumber, rep)
-		expectedPeriods := []protocol.PacketNumber{25, 50, 100, 200, 300, 300, 300}
-
-		for i := 0; i < rep; i++ {
-			png := newSkippingPacketNumberGenerator(initialPN, initialPeriod, maxPeriod)
-			last := initialPN
-			lastSkip := initialPN
-			for len(periods[i]) < len(expectedPeriods) {
-				next := png.Pop()
-				if next > last+1 {
-					skipped := next - 1
-					Expect(skipped).To(BeNumerically(">", lastSkip+1))
-					periods[i] = append(periods[i], skipped-lastSkip-1)
-					lastSkip = skipped
-				}
-				last = next
+	for i := range rep {
+		png := newPacketNumberGenerator(initialPN, initialPeriod, maxPeriod)
+		lastSkip := initialPN
+		for len(periods[i]) < len(expectedPeriods) {
+			skipNext, next := png.Pop(true)
+			if skipNext {
+				skipped := next + 1
+				require.Greater(t, skipped, lastSkip+1)
+				periods[i] = append(periods[i], skipped-lastSkip-1)
+				lastSkip = skipped
 			}
 		}
+	}
 
-		for j := 0; j < len(expectedPeriods); j++ {
-			var average float64
-			for i := 0; i < rep; i++ {
-				average += float64(periods[i][j]) / float64(len(periods))
-			}
-			fmt.Fprintf(GinkgoWriter, "Period %d: %.2f (expected %d)\n", j, average, expectedPeriods[j])
-			tolerance := protocol.PacketNumber(5)
-			if t := expectedPeriods[j] / 10; t > tolerance {
-				tolerance = t
-			}
-			Expect(average).To(BeNumerically("~", expectedPeriods[j]+1 /* we never skip two packet numbers at the same time */, tolerance))
+	for j := range expectedPeriods {
+		var average float64
+		for i := range rep {
+			average += float64(periods[i][j]) / float64(len(periods))
 		}
-	})
-})
+		t.Logf("Period %d: %.2f (expected %d)\n", j, average, expectedPeriods[j])
+		require.InDelta(t,
+			float64(expectedPeriods[j]+1),
+			average,
+			float64(max(protocol.PacketNumber(5), expectedPeriods[j]/10)),
+		)
+	}
+}

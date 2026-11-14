@@ -2,10 +2,11 @@ package quicvarint
 
 import (
 	"bytes"
+	"fmt"
 	"io"
+	"testing"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
 type nopReader struct{}
@@ -22,51 +23,149 @@ func (r *nopWriter) Write(_ []byte) (int, error) {
 	return 0, io.ErrShortBuffer
 }
 
+// errorReader returns data and an error together at the end of the input.
+type errorReader struct {
+	Data []byte
+	Err  error
+	pos  int
+}
+
+func (r *errorReader) Read(b []byte) (int, error) {
+	n := copy(b, r.Data[r.pos:])
+	r.pos += n
+	if r.pos >= len(r.Data) {
+		return n, r.Err
+	}
+	return n, nil
+}
+
+func (r *errorReader) Peek(b []byte) (int, error) {
+	n := copy(b, r.Data[r.pos:])
+	if r.pos+n >= len(r.Data) {
+		return n, r.Err
+	}
+	return n, nil
+}
+
 var _ io.Writer = &nopWriter{}
 
-var _ = Describe("Varint I/O", func() {
-	Context("Reader", func() {
-		Context("NewReader", func() {
-			It("passes through a Reader unchanged", func() {
-				b := bytes.NewReader([]byte{0})
-				r := NewReader(b)
-				Expect(r).To(Equal(b))
-			})
+func TestReaderPassesThroughUnchanged(t *testing.T) {
+	b := bytes.NewReader([]byte{0})
+	r := NewReader(b)
+	require.Same(t, b, r)
+}
 
-			It("wraps an io.Reader", func() {
-				n := &nopReader{}
-				r := NewReader(n)
-				Expect(r).ToNot(Equal(n))
-			})
+func TestReaderWrapsIOReader(t *testing.T) {
+	n := &nopReader{}
+	r := NewReader(n)
+	require.NotSame(t, n, r)
+}
+
+func TestReaderFailure(t *testing.T) {
+	r := NewReader(&nopReader{})
+	val, err := r.ReadByte()
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	require.Equal(t, byte(0), val)
+}
+
+func TestReaderHandlesEOF(t *testing.T) {
+	// test that the errorReader behaves as we expect
+	r := &errorReader{Data: []byte("foobar"), Err: io.EOF}
+	b := make([]byte, 3)
+	n, err := r.Read(b)
+	require.Equal(t, 3, n)
+	require.NoError(t, err)
+	require.Equal(t, "foo", string(b))
+	n, err = r.Read(b)
+	require.Equal(t, 3, n)
+	require.ErrorIs(t, err, io.EOF)
+	require.Equal(t, "bar", string(b))
+	n, err = r.Read(b)
+	require.ErrorIs(t, err, io.EOF)
+	require.Zero(t, n)
+
+	// now test using it to read varints
+	reader := NewReader(&errorReader{Data: Append(nil, 1337), Err: io.EOF})
+	n2, err := Read(reader)
+	require.NoError(t, err)
+	require.EqualValues(t, 1337, n2)
+}
+
+// Regression test: empty reads were being converted to successful
+// reads of a zero value. See https://github.com/quic-go/quic-go/pull/5275.
+func TestReaderHandlesEmptyRead(t *testing.T) {
+	r, w := io.Pipe()
+
+	go func() {
+		// io.Pipe turns empty writes into empty reads.
+		w.Write(nil)
+		w.Close()
+	}()
+
+	br := NewReader(r)
+	_, err := Read(br)
+	require.ErrorIs(t, err, io.EOF)
+}
+
+func TestWriterPassesThroughUnchanged(t *testing.T) {
+	b := &bytes.Buffer{}
+	w := NewWriter(b)
+	require.Same(t, b, w)
+}
+
+func TestWriterWrapsIOWriter(t *testing.T) {
+	n := &nopWriter{}
+	w := NewWriter(n)
+	require.NotSame(t, n, w)
+}
+
+func TestWriterFailure(t *testing.T) {
+	w := NewWriter(&nopWriter{})
+	err := w.WriteByte(0)
+	require.ErrorIs(t, err, io.ErrShortBuffer)
+}
+
+type bufPeeker []byte
+
+func (p bufPeeker) Peek(b []byte) (int, error) {
+	if len(p) < len(b) {
+		return copy(b, p), io.ErrUnexpectedEOF
+	}
+	return copy(b, p), nil
+}
+
+func TestPeek(t *testing.T) {
+	for _, c := range []bufPeeker{
+		{0b00011001},                   // 1-byte
+		{0b01111011, 0xbd},             // 2-byte
+		{0b10011101, 0x7f, 0x3e, 0x7d}, // 4-byte
+		{0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c}, // 8-byte
+	} {
+		t.Run(fmt.Sprintf("%d bytes", len(c)), func(t *testing.T) {
+			peekVal, err := Peek(append(c, []byte("foobar")...)) // append some data, which doesn't matter
+			require.NoError(t, err)
+			parseVal, _, err := Parse(c)
+			require.NoError(t, err)
+			require.Equal(t, parseVal, peekVal)
 		})
+	}
+}
 
-		It("returns an error when reading from an underlying io.Reader fails", func() {
-			r := NewReader(&nopReader{})
-			val, err := r.ReadByte()
-			Expect(err).To(Equal(io.ErrUnexpectedEOF))
-			Expect(val).To(Equal(byte(0)))
+func TestPeekErrors(t *testing.T) {
+	errorCases := []struct {
+		name  string
+		input bufPeeker
+	}{
+		{"empty input", bufPeeker{}},
+		{"2-byte, missing 1", bufPeeker{0b01000001}},
+		{"4-byte, missing 1", bufPeeker{0b10000000, 0, 0}},
+		{"8-byte, missing 1", bufPeeker{0b11000000, 0, 0, 0, 0, 0, 0}},
+	}
+
+	for _, tc := range errorCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Peek(tc.input)
+			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 		})
-	})
-
-	Context("Writer", func() {
-		Context("NewWriter", func() {
-			It("passes through a Writer unchanged", func() {
-				b := &bytes.Buffer{}
-				w := NewWriter(b)
-				Expect(w).To(Equal(b))
-			})
-
-			It("wraps an io.Writer", func() {
-				n := &nopWriter{}
-				w := NewWriter(n)
-				Expect(w).ToNot(Equal(n))
-			})
-		})
-
-		It("returns an error when writing to an underlying io.Writer fails", func() {
-			w := NewWriter(&nopWriter{})
-			err := w.WriteByte(0)
-			Expect(err).To(Equal(io.ErrShortBuffer))
-		})
-	})
-})
+	}
+}

@@ -1,15 +1,29 @@
 package quic
 
+import (
+	"net"
+
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/udp"
+)
+
 type sender interface {
-	Send(p *packetBuffer)
+	Send(p *udp.PacketBuffer, gsoSize uint16, ecn protocol.ECN)
+	SendProbe(*udp.PacketBuffer, net.Addr, udp.PacketInfo)
 	Run() error
 	WouldBlock() bool
 	Available() <-chan struct{}
 	Close()
 }
 
+type queueEntry struct {
+	buf     *udp.PacketBuffer
+	gsoSize uint16
+	ecn     protocol.ECN
+}
+
 type sendQueue struct {
-	queue       chan *packetBuffer
+	queue       chan queueEntry
 	closeCalled chan struct{} // runStopped when Close() is called
 	runStopped  chan struct{} // runStopped when the run loop returns
 	available   chan struct{}
@@ -26,20 +40,31 @@ func newSendQueue(conn sendConn) sender {
 		runStopped:  make(chan struct{}),
 		closeCalled: make(chan struct{}),
 		available:   make(chan struct{}, 1),
-		queue:       make(chan *packetBuffer, sendQueueCapacity),
+		queue:       make(chan queueEntry, sendQueueCapacity),
 	}
 }
 
 // Send sends out a packet. It's guaranteed to not block.
 // Callers need to make sure that there's actually space in the send queue by calling WouldBlock.
 // Otherwise Send will panic.
-func (h *sendQueue) Send(p *packetBuffer) {
+func (h *sendQueue) Send(p *udp.PacketBuffer, gsoSize uint16, ecn protocol.ECN) {
 	select {
-	case h.queue <- p:
+	case h.queue <- queueEntry{buf: p, gsoSize: gsoSize, ecn: ecn}:
+		// clear available channel if we've reached capacity
+		if len(h.queue) == sendQueueCapacity {
+			select {
+			case <-h.available:
+			default:
+			}
+		}
 	case <-h.runStopped:
 	default:
 		panic("sendQueue.Send would have blocked")
 	}
+}
+
+func (h *sendQueue) SendProbe(p *udp.PacketBuffer, addr net.Addr, info udp.PacketInfo) {
+	h.conn.WriteTo(p.Data, addr, info)
 }
 
 func (h *sendQueue) WouldBlock() bool {
@@ -62,11 +87,17 @@ func (h *sendQueue) Run() error {
 			h.closeCalled = nil // prevent this case from being selected again
 			// make sure that all queued packets are actually sent out
 			shouldClose = true
-		case p := <-h.queue:
-			if err := h.conn.Write(p.Data); err != nil {
-				return err
+		case e := <-h.queue:
+			if err := h.conn.Write(e.buf.Data, e.gsoSize, e.ecn); err != nil {
+				// This additional check enables:
+				// 1. Checking for "datagram too large" message from the kernel, as such,
+				// 2. Path MTU discovery,and
+				// 3. Eventual detection of loss PingFrame.
+				if !udp.IsSendMsgSizeErr(err) {
+					return err
+				}
 			}
-			p.Release()
+			e.buf.Release()
 			select {
 			case h.available <- struct{}{}:
 			default:

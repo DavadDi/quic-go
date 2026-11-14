@@ -1,108 +1,117 @@
 package wire
 
 import (
-	"bytes"
 	"fmt"
 	"io"
+	"testing"
 
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/quicvarint"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/quicvarint"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("STREAMS_BLOCKED frame", func() {
-	Context("parsing", func() {
-		It("accepts a frame for bidirectional streams", func() {
-			expected := []byte{0x16}
-			expected = append(expected, encodeVarInt(0x1337)...)
-			b := bytes.NewReader(expected)
-			f, err := parseStreamsBlockedFrame(b, protocol.VersionWhatever)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(f.Type).To(Equal(protocol.StreamTypeBidi))
-			Expect(f.StreamLimit).To(BeEquivalentTo(0x1337))
-			Expect(b.Len()).To(BeZero())
-		})
+func TestParseStreamsBlockedFrameBidirectional(t *testing.T) {
+	data := encodeVarInt(0x1337)
+	f, l, err := parseStreamsBlockedFrame(data, FrameTypeBidiStreamBlocked, protocol.Version1)
+	require.NoError(t, err)
+	require.Equal(t, protocol.StreamTypeBidi, f.Type)
+	require.EqualValues(t, 0x1337, f.StreamLimit)
+	require.Equal(t, len(data), l)
+}
 
-		It("accepts a frame for unidirectional streams", func() {
-			expected := []byte{0x17}
-			expected = append(expected, encodeVarInt(0x7331)...)
-			b := bytes.NewReader(expected)
-			f, err := parseStreamsBlockedFrame(b, protocol.VersionWhatever)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(f.Type).To(Equal(protocol.StreamTypeUni))
-			Expect(f.StreamLimit).To(BeEquivalentTo(0x7331))
-			Expect(b.Len()).To(BeZero())
-		})
+func TestParseStreamsBlockedFrameUnidirectional(t *testing.T) {
+	data := encodeVarInt(0x7331)
+	f, l, err := parseStreamsBlockedFrame(data, FrameTypeUniStreamBlocked, protocol.Version1)
+	require.NoError(t, err)
+	require.Equal(t, protocol.StreamTypeUni, f.Type)
+	require.EqualValues(t, 0x7331, f.StreamLimit)
+	require.Equal(t, len(data), l)
+}
 
-		It("errors on EOFs", func() {
-			data := []byte{0x16}
-			data = append(data, encodeVarInt(0x12345678)...)
-			_, err := parseStreamsBlockedFrame(bytes.NewReader(data), versionIETFFrames)
-			Expect(err).ToNot(HaveOccurred())
-			for i := range data {
-				_, err := parseStreamsBlockedFrame(bytes.NewReader(data[:i]), versionIETFFrames)
-				Expect(err).To(MatchError(io.EOF))
-			}
-		})
+func TestParseStreamsBlockedFrameErrorsOnEOFs(t *testing.T) {
+	data := encodeVarInt(0x12345678)
+	_, l, err := parseStreamsBlockedFrame(data, FrameTypeBidiStreamBlocked, protocol.Version1)
+	require.NoError(t, err)
+	require.Equal(t, len(data), l)
+	for i := range data {
+		_, _, err := parseStreamsBlockedFrame(data[:i], FrameTypeBidiStreamBlocked, protocol.Version1)
+		require.ErrorIs(t, err, io.EOF)
+	}
+}
 
-		for _, t := range []protocol.StreamType{protocol.StreamTypeUni, protocol.StreamTypeBidi} {
-			streamType := t
-
-			It("accepts a frame containing the maximum stream count", func() {
-				f := &StreamsBlockedFrame{
-					Type:        streamType,
-					StreamLimit: protocol.MaxStreamCount,
-				}
-				b := &bytes.Buffer{}
-				Expect(f.Write(b, protocol.VersionWhatever)).To(Succeed())
-				frame, err := parseStreamsBlockedFrame(bytes.NewReader(b.Bytes()), protocol.VersionWhatever)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(frame).To(Equal(f))
-			})
-
-			It("errors when receiving a too large stream count", func() {
-				f := &StreamsBlockedFrame{
-					Type:        streamType,
-					StreamLimit: protocol.MaxStreamCount + 1,
-				}
-				b := &bytes.Buffer{}
-				Expect(f.Write(b, protocol.VersionWhatever)).To(Succeed())
-				_, err := parseStreamsBlockedFrame(bytes.NewReader(b.Bytes()), protocol.VersionWhatever)
-				Expect(err).To(MatchError(fmt.Sprintf("%d exceeds the maximum stream count", protocol.MaxStreamCount+1)))
-			})
+func TestParseStreamsBlockedFrameMaxStreamCount(t *testing.T) {
+	for _, streamType := range []protocol.StreamType{protocol.StreamTypeUni, protocol.StreamTypeBidi} {
+		var streamTypeStr string
+		if streamType == protocol.StreamTypeUni {
+			streamTypeStr = "unidirectional"
+		} else {
+			streamTypeStr = "bidirectional"
 		}
-	})
-
-	Context("writing", func() {
-		It("writes a frame for bidirectional streams", func() {
-			b := &bytes.Buffer{}
-			f := StreamsBlockedFrame{
-				Type:        protocol.StreamTypeBidi,
-				StreamLimit: 0xdeadbeefcafe,
+		t.Run(streamTypeStr, func(t *testing.T) {
+			f := &StreamsBlockedFrame{
+				Type:        streamType,
+				StreamLimit: protocol.MaxStreamCount,
 			}
-			Expect(f.Write(b, protocol.VersionWhatever)).To(Succeed())
-			expected := []byte{0x16}
-			expected = append(expected, encodeVarInt(0xdeadbeefcafe)...)
-			Expect(b.Bytes()).To(Equal(expected))
+			b, err := f.Append(nil, protocol.Version1)
+			require.NoError(t, err)
+			typ, l, err := quicvarint.Parse(b)
+			require.NoError(t, err)
+			b = b[l:]
+			frame, l, err := parseStreamsBlockedFrame(b, FrameType(typ), protocol.Version1)
+			require.NoError(t, err)
+			require.Equal(t, f, frame)
+			require.Equal(t, len(b), l)
 		})
+	}
+}
 
-		It("writes a frame for unidirectional streams", func() {
-			b := &bytes.Buffer{}
-			f := StreamsBlockedFrame{
-				Type:        protocol.StreamTypeUni,
-				StreamLimit: 0xdeadbeefcafe,
+func TestParseStreamsBlockedFrameErrorOnTooLargeStreamCount(t *testing.T) {
+	for _, streamType := range []protocol.StreamType{protocol.StreamTypeUni, protocol.StreamTypeBidi} {
+		var streamTypeStr string
+		if streamType == protocol.StreamTypeUni {
+			streamTypeStr = "unidirectional"
+		} else {
+			streamTypeStr = "bidirectional"
+		}
+		t.Run(streamTypeStr, func(t *testing.T) {
+			f := &StreamsBlockedFrame{
+				Type:        streamType,
+				StreamLimit: protocol.MaxStreamCount + 1,
 			}
-			Expect(f.Write(b, protocol.VersionWhatever)).To(Succeed())
-			expected := []byte{0x17}
-			expected = append(expected, encodeVarInt(0xdeadbeefcafe)...)
-			Expect(b.Bytes()).To(Equal(expected))
+			b, err := f.Append(nil, protocol.Version1)
+			require.NoError(t, err)
+			typ, l, err := quicvarint.Parse(b)
+			require.NoError(t, err)
+			b = b[l:]
+			_, _, err = parseStreamsBlockedFrame(b, FrameType(typ), protocol.Version1)
+			require.EqualError(t, err, fmt.Sprintf("%d exceeds the maximum stream count", protocol.MaxStreamCount+1))
 		})
+	}
+}
 
-		It("has the correct min length", func() {
-			frame := StreamsBlockedFrame{StreamLimit: 0x123456}
-			Expect(frame.Length(0)).To(Equal(protocol.ByteCount(1) + quicvarint.Len(0x123456)))
-		})
-	})
-})
+func TestWriteStreamsBlockedFrameBidirectional(t *testing.T) {
+	f := StreamsBlockedFrame{
+		Type:        protocol.StreamTypeBidi,
+		StreamLimit: 0xdeadbeefcafe,
+	}
+	b, err := f.Append(nil, protocol.Version1)
+	require.NoError(t, err)
+	expected := []byte{byte(FrameTypeBidiStreamBlocked)}
+	expected = append(expected, encodeVarInt(0xdeadbeefcafe)...)
+	require.Equal(t, expected, b)
+	require.Len(t, b, int(f.Length(protocol.Version1)))
+}
+
+func TestWriteStreamsBlockedFrameUnidirectional(t *testing.T) {
+	f := StreamsBlockedFrame{
+		Type:        protocol.StreamTypeUni,
+		StreamLimit: 0xdeadbeefcafe,
+	}
+	b, err := f.Append(nil, protocol.Version1)
+	require.NoError(t, err)
+	expected := []byte{byte(FrameTypeUniStreamBlocked)}
+	expected = append(expected, encodeVarInt(0xdeadbeefcafe)...)
+	require.Equal(t, expected, b)
+	require.Len(t, b, int(f.Length(protocol.Version1)))
+}

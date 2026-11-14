@@ -1,10 +1,8 @@
 package wire
 
 import (
-	"bytes"
-
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/quicvarint"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 // A DataBlockedFrame is a DATA_BLOCKED frame
@@ -12,27 +10,20 @@ type DataBlockedFrame struct {
 	MaximumData protocol.ByteCount
 }
 
-func parseDataBlockedFrame(r *bytes.Reader, _ protocol.VersionNumber) (*DataBlockedFrame, error) {
-	if _, err := r.ReadByte(); err != nil {
-		return nil, err
-	}
-	offset, err := quicvarint.Read(r)
+func parseDataBlockedFrame(b []byte, _ protocol.Version) (*DataBlockedFrame, int, error) {
+	offset, l, err := quicvarint.Parse(b)
 	if err != nil {
-		return nil, err
+		return nil, 0, replaceUnexpectedEOF(err)
 	}
-	return &DataBlockedFrame{
-		MaximumData: protocol.ByteCount(offset),
-	}, nil
+	return &DataBlockedFrame{MaximumData: protocol.ByteCount(offset)}, l, nil
 }
 
-func (f *DataBlockedFrame) Write(b *bytes.Buffer, version protocol.VersionNumber) error {
-	typeByte := uint8(0x14)
-	b.WriteByte(typeByte)
-	quicvarint.Write(b, uint64(f.MaximumData))
-	return nil
+func (f *DataBlockedFrame) Append(b []byte, version protocol.Version) ([]byte, error) {
+	b = append(b, byte(FrameTypeDataBlocked))
+	return quicvarint.Append(b, uint64(f.MaximumData)), nil
 }
 
 // Length of a written frame
-func (f *DataBlockedFrame) Length(version protocol.VersionNumber) protocol.ByteCount {
-	return 1 + quicvarint.Len(uint64(f.MaximumData))
+func (f *DataBlockedFrame) Length(version protocol.Version) protocol.ByteCount {
+	return 1 + protocol.ByteCount(quicvarint.Len(uint64(f.MaximumData)))
 }

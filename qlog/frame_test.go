@@ -2,376 +2,476 @@ package qlog
 
 import (
 	"bytes"
-	"encoding/json"
+	"testing"
 	"time"
 
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/internal/qerr"
-	"github.com/lucas-clemente/quic-go/logging"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/qerr"
+	"github.com/quic-go/quic-go/internal/wire"
+	"github.com/quic-go/quic-go/qlogwriter/jsontext"
 
-	"github.com/francoispqt/gojay"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("Frames", func() {
-	check := func(f logging.Frame, expected map[string]interface{}) {
-		buf := &bytes.Buffer{}
-		enc := gojay.NewEncoder(buf)
-		ExpectWithOffset(1, enc.Encode(frame{Frame: f})).To(Succeed())
-		data := buf.Bytes()
-		ExpectWithOffset(1, json.Valid(data)).To(BeTrue())
-		checkEncoding(data, expected)
-	}
+func check(t *testing.T, f any, expected string) {
+	t.Helper()
 
-	It("marshals PING frames", func() {
-		check(
-			&logging.PingFrame{},
-			map[string]interface{}{
-				"frame_type": "ping",
-			},
-		)
-	})
+	var buf bytes.Buffer
+	enc := jsontext.NewEncoder(&buf)
+	require.NoError(t, (Frame{Frame: f}).Encode(enc))
+	require.JSONEq(t, expected, buf.String())
+}
 
-	It("marshals ACK frames with a range acknowledging a single packet", func() {
-		check(
-			&logging.AckFrame{
+func TestPingFrame(t *testing.T) {
+	check(t, &PingFrame{}, `{"frame_type": "ping"}`)
+}
+
+func TestAckFrame(t *testing.T) {
+	tests := []struct {
+		name     string
+		frame    *AckFrame
+		expected string
+	}{
+		{
+			name: "with delay and single packet range",
+			frame: &AckFrame{
 				DelayTime: 86 * time.Millisecond,
-				AckRanges: []logging.AckRange{{Smallest: 120, Largest: 120}},
+				AckRanges: []AckRange{{Smallest: 120, Largest: 120}},
 			},
-			map[string]interface{}{
-				"frame_type":   "ack",
-				"ack_delay":    86,
-				"acked_ranges": [][]float64{{120}},
+			expected: `{
+				"frame_type": "ack",
+				"ack_delay": 86,
+				"acked_ranges": [[120]]
+			}`,
+		},
+		{
+			name: "without delay",
+			frame: &AckFrame{
+				AckRanges: []AckRange{{Smallest: 120, Largest: 120}},
 			},
-		)
-	})
-
-	It("marshals ACK frames without a delay", func() {
-		check(
-			&logging.AckFrame{
-				AckRanges: []logging.AckRange{{Smallest: 120, Largest: 120}},
-			},
-			map[string]interface{}{
-				"frame_type":   "ack",
-				"acked_ranges": [][]float64{{120}},
-			},
-		)
-	})
-
-	It("marshals ACK frames with ECN counts", func() {
-		check(
-			&logging.AckFrame{
-				AckRanges: []logging.AckRange{{Smallest: 120, Largest: 120}},
+			expected: `{
+				"frame_type": "ack",
+				"acked_ranges": [[120]]
+			}`,
+		},
+		{
+			name: "with ECN counts",
+			frame: &AckFrame{
+				AckRanges: []AckRange{{Smallest: 120, Largest: 120}},
 				ECT0:      10,
 				ECT1:      100,
 				ECNCE:     1000,
 			},
-			map[string]interface{}{
-				"frame_type":   "ack",
-				"acked_ranges": [][]float64{{120}},
-				"ect0":         10,
-				"ect1":         100,
-				"ce":           1000,
-			},
-		)
-	})
-
-	It("marshals ACK frames with a range acknowledging ranges of packets", func() {
-		check(
-			&logging.AckFrame{
+			expected: `{
+				"frame_type": "ack",
+				"acked_ranges": [[120]],
+				"ect0": 10,
+				"ect1": 100,
+				"ce": 1000
+			}`,
+		},
+		{
+			name: "with multiple ranges",
+			frame: &AckFrame{
 				DelayTime: 86 * time.Millisecond,
-				AckRanges: []logging.AckRange{
+				AckRanges: []AckRange{
 					{Smallest: 5, Largest: 50},
 					{Smallest: 100, Largest: 120},
 				},
 			},
-			map[string]interface{}{
+			expected: `{
 				"frame_type": "ack",
-				"ack_delay":  86,
-				"acked_ranges": [][]float64{
-					{5, 50},
-					{100, 120},
-				},
-			},
-		)
-	})
+				"ack_delay": 86,
+				"acked_ranges": [
+					[5, 50],
+					[100, 120]
+				]
+			}`,
+		},
+	}
 
-	It("marshals RESET_STREAM frames", func() {
-		check(
-			&logging.ResetStreamFrame{
-				StreamID:  987,
-				FinalSize: 1234,
-				ErrorCode: 42,
-			},
-			map[string]interface{}{
-				"frame_type": "reset_stream",
-				"stream_id":  987,
-				"error_code": 42,
-				"final_size": 1234,
-			},
-		)
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			check(t, tt.frame, tt.expected)
+		})
+	}
+}
 
-	It("marshals STOP_SENDING frames", func() {
-		check(
-			&logging.StopSendingFrame{
-				StreamID:  987,
-				ErrorCode: 42,
-			},
-			map[string]interface{}{
-				"frame_type": "stop_sending",
-				"stream_id":  987,
-				"error_code": 42,
-			},
-		)
-	})
+func TestResetStreamFrame(t *testing.T) {
+	check(t,
+		&ResetStreamFrame{
+			StreamID:  987,
+			FinalSize: 1234,
+			ErrorCode: 42,
+		},
+		`{
+			"frame_type": "reset_stream",
+			"stream_id": 987,
+			"error_code": 42,
+			"final_size": 1234
+		}`,
+	)
+}
 
-	It("marshals CRYPTO frames", func() {
-		check(
-			&logging.CryptoFrame{
-				Offset: 1337,
-				Length: 6,
-			},
-			map[string]interface{}{
-				"frame_type": "crypto",
-				"offset":     1337,
-				"length":     6,
-			},
-		)
-	})
+func TestResetStreamAtFrame(t *testing.T) {
+	check(t,
+		&ResetStreamFrame{
+			StreamID:     987,
+			FinalSize:    1234,
+			ErrorCode:    42,
+			ReliableSize: 999,
+		},
+		`{
+			"frame_type": "reset_stream_at",
+			"stream_id": 987,
+			"error_code": 42,
+			"final_size": 1234,
+			"reliable_size": 999
+		}`,
+	)
+}
 
-	It("marshals NEW_TOKEN frames", func() {
-		check(
-			&logging.NewTokenFrame{
-				Token: []byte{0xde, 0xad, 0xbe, 0xef},
-			},
-			map[string]interface{}{
-				"frame_type": "new_token",
-				"token":      map[string]interface{}{"data": "deadbeef"},
-			},
-		)
-	})
+func TestAckFrequencyFrame(t *testing.T) {
+	check(t,
+		&AckFrequencyFrame{
+			SequenceNumber:        1337,
+			AckElicitingThreshold: 123,
+			RequestMaxAckDelay:    42 * time.Millisecond,
+			ReorderingThreshold:   1234,
+		},
+		`{
+			"frame_type": "ack_frequency",
+			"sequence_number": 1337,
+			"ack_eliciting_threshold": 123,
+			"request_max_ack_delay": 42,
+			"reordering_threshold": 1234
+		}`,
+	)
+}
 
-	It("marshals STREAM frames with FIN", func() {
-		check(
-			&logging.StreamFrame{
+func TestImmediateAckFrame(t *testing.T) {
+	check(t,
+		&ImmediateAckFrame{},
+		`{
+			"frame_type": "immediate_ack"
+		}`,
+	)
+}
+
+func TestStopSendingFrame(t *testing.T) {
+	check(t,
+		&StopSendingFrame{StreamID: 987, ErrorCode: 42},
+		`{
+			"frame_type": "stop_sending",
+			"stream_id": 987,
+			"error_code": 42
+		}`,
+	)
+}
+
+func TestCryptoFrame(t *testing.T) {
+	check(t,
+		&CryptoFrame{Offset: 1337, Length: 6},
+		`{
+			"frame_type": "crypto",
+			"offset": 1337,
+			"length": 6
+		}`,
+	)
+}
+
+func TestNewTokenFrame(t *testing.T) {
+	check(t,
+		&NewTokenFrame{Token: []byte{0xde, 0xad, 0xbe, 0xef}},
+		`{
+			"frame_type": "new_token",
+			"token": {"raw": {"data": "deadbeef"}}
+		}`,
+	)
+}
+
+func TestStreamFrame(t *testing.T) {
+	tests := []struct {
+		name     string
+		frame    *StreamFrame
+		expected string
+	}{
+		{
+			name: "with FIN",
+			frame: &StreamFrame{
 				StreamID: 42,
 				Offset:   1337,
 				Fin:      true,
 				Length:   9876,
 			},
-			map[string]interface{}{
+			expected: `{
 				"frame_type": "stream",
-				"stream_id":  42,
-				"offset":     1337,
-				"fin":        true,
-				"length":     9876,
-			},
-		)
-	})
-
-	It("marshals STREAM frames without FIN", func() {
-		check(
-			&logging.StreamFrame{
+				"stream_id": 42,
+				"offset": 1337,
+				"fin": true,
+				"length": 9876
+			}`,
+		},
+		{
+			name: "without FIN",
+			frame: &StreamFrame{
 				StreamID: 42,
 				Offset:   1337,
 				Length:   3,
 			},
-			map[string]interface{}{
+			expected: `{
 				"frame_type": "stream",
-				"stream_id":  42,
-				"offset":     1337,
-				"length":     3,
-			},
-		)
-	})
+				"stream_id": 42,
+				"offset": 1337,
+				"length": 3
+			}`,
+		},
+	}
 
-	It("marshals MAX_DATA frames", func() {
-		check(
-			&logging.MaxDataFrame{
-				MaximumData: 1337,
-			},
-			map[string]interface{}{
-				"frame_type": "max_data",
-				"maximum":    1337,
-			},
-		)
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			check(t, tt.frame, tt.expected)
+		})
+	}
+}
 
-	It("marshals MAX_STREAM_DATA frames", func() {
-		check(
-			&logging.MaxStreamDataFrame{
-				StreamID:          1234,
-				MaximumStreamData: 1337,
-			},
-			map[string]interface{}{
-				"frame_type": "max_stream_data",
-				"stream_id":  1234,
-				"maximum":    1337,
-			},
-		)
-	})
+func TestMaxDataFrame(t *testing.T) {
+	check(t,
+		&MaxDataFrame{MaximumData: 1337},
+		`{
+			"frame_type": "max_data",
+			"maximum": 1337
+		}`,
+	)
+}
 
-	It("marshals MAX_STREAMS frames", func() {
-		check(
-			&logging.MaxStreamsFrame{
-				Type:         protocol.StreamTypeBidi,
-				MaxStreamNum: 42,
-			},
-			map[string]interface{}{
-				"frame_type":  "max_streams",
-				"stream_type": "bidirectional",
-				"maximum":     42,
-			},
-		)
-	})
+func TestMaxStreamDataFrame(t *testing.T) {
+	check(t,
+		&MaxStreamDataFrame{StreamID: 1234, MaximumStreamData: 1337},
+		`{
+			"frame_type": "max_stream_data",
+			"stream_id": 1234,
+			"maximum": 1337
+		}`,
+	)
+}
 
-	It("marshals DATA_BLOCKED frames", func() {
-		check(
-			&logging.DataBlockedFrame{
-				MaximumData: 1337,
-			},
-			map[string]interface{}{
-				"frame_type": "data_blocked",
-				"limit":      1337,
-			},
-		)
-	})
+func TestMaxStreamsFrame(t *testing.T) {
+	check(t,
+		&MaxStreamsFrame{
+			Type:         protocol.StreamTypeBidi,
+			MaxStreamNum: 42,
+		},
+		`{
+			"frame_type": "max_streams",
+			"stream_type": "bidirectional",
+			"maximum": 42
+		}`,
+	)
+}
 
-	It("marshals STREAM_DATA_BLOCKED frames", func() {
-		check(
-			&logging.StreamDataBlockedFrame{
-				StreamID:          42,
-				MaximumStreamData: 1337,
-			},
-			map[string]interface{}{
-				"frame_type": "stream_data_blocked",
-				"stream_id":  42,
-				"limit":      1337,
-			},
-		)
-	})
+func TestDataBlockedFrame(t *testing.T) {
+	check(t,
+		&DataBlockedFrame{MaximumData: 1337},
+		`{
+			"frame_type": "data_blocked",
+			"limit": 1337
+		}`,
+	)
+}
 
-	It("marshals STREAMS_BLOCKED frames", func() {
-		check(
-			&logging.StreamsBlockedFrame{
-				Type:        protocol.StreamTypeUni,
-				StreamLimit: 123,
-			},
-			map[string]interface{}{
-				"frame_type":  "streams_blocked",
-				"stream_type": "unidirectional",
-				"limit":       123,
-			},
-		)
-	})
+func TestStreamDataBlockedFrame(t *testing.T) {
+	check(t,
+		&StreamDataBlockedFrame{
+			StreamID:          42,
+			MaximumStreamData: 1337,
+		},
+		`{
+			"frame_type": "stream_data_blocked",
+			"stream_id": 42,
+			"limit": 1337
+		}`,
+	)
+}
 
-	It("marshals NEW_CONNECTION_ID frames", func() {
-		check(
-			&logging.NewConnectionIDFrame{
-				SequenceNumber:      42,
-				RetirePriorTo:       24,
-				ConnectionID:        protocol.ConnectionID{0xde, 0xad, 0xbe, 0xef},
-				StatelessResetToken: protocol.StatelessResetToken{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf},
-			},
-			map[string]interface{}{
-				"frame_type":            "new_connection_id",
-				"sequence_number":       42,
-				"retire_prior_to":       24,
-				"length":                4,
-				"connection_id":         "deadbeef",
-				"stateless_reset_token": "000102030405060708090a0b0c0d0e0f",
-			},
-		)
-	})
+func TestStreamsBlockedFrame(t *testing.T) {
+	check(t,
+		&StreamsBlockedFrame{
+			Type:        protocol.StreamTypeUni,
+			StreamLimit: 123,
+		},
+		`{
+			"frame_type": "streams_blocked",
+			"stream_type": "unidirectional",
+			"limit": 123
+		}`,
+	)
+}
 
-	It("marshals RETIRE_CONNECTION_ID frames", func() {
-		check(
-			&logging.RetireConnectionIDFrame{
-				SequenceNumber: 1337,
-			},
-			map[string]interface{}{
-				"frame_type":      "retire_connection_id",
-				"sequence_number": 1337,
-			},
-		)
-	})
+func TestNewConnectionIDFrame(t *testing.T) {
+	check(t,
+		&NewConnectionIDFrame{
+			SequenceNumber:      42,
+			RetirePriorTo:       24,
+			ConnectionID:        protocol.ParseConnectionID([]byte{0xde, 0xad, 0xbe, 0xef}),
+			StatelessResetToken: protocol.StatelessResetToken{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf},
+		},
+		`{
+			"frame_type": "new_connection_id",
+			"sequence_number": 42,
+			"retire_prior_to": 24,
+			"connection_id": "deadbeef",
+			"stateless_reset_token": "000102030405060708090a0b0c0d0e0f"
+		}`,
+	)
+}
 
-	It("marshals PATH_CHALLENGE frames", func() {
-		check(
-			&logging.PathChallengeFrame{
-				Data: [8]byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xc0, 0x01},
-			},
-			map[string]interface{}{
-				"frame_type": "path_challenge",
-				"data":       "deadbeefcafec001",
-			},
-		)
-	})
+func TestRetireConnectionIDFrame(t *testing.T) {
+	check(t,
+		&RetireConnectionIDFrame{SequenceNumber: 1337},
+		`{
+			"frame_type": "retire_connection_id",
+			"sequence_number": 1337
+		}`,
+	)
+}
 
-	It("marshals PATH_RESPONSE frames", func() {
-		check(
-			&logging.PathResponseFrame{
-				Data: [8]byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xc0, 0x01},
-			},
-			map[string]interface{}{
-				"frame_type": "path_response",
-				"data":       "deadbeefcafec001",
-			},
-		)
-	})
+func TestPathChallengeFrame(t *testing.T) {
+	check(t,
+		&PathChallengeFrame{Data: [8]byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xc0, 0x01}},
+		`{
+			"frame_type": "path_challenge",
+			"data": "deadbeefcafec001"
+		}`,
+	)
+}
 
-	It("marshals CONNECTION_CLOSE frames, for application error codes", func() {
-		check(
-			&logging.ConnectionCloseFrame{
+func TestPathResponseFrame(t *testing.T) {
+	check(t,
+		&PathResponseFrame{Data: [8]byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xc0, 0x01}},
+		`{
+			"frame_type": "path_response",
+			"data": "deadbeefcafec001"
+		}`,
+	)
+}
+
+func TestConnectionCloseFrame(t *testing.T) {
+	tests := []struct {
+		name     string
+		frame    *ConnectionCloseFrame
+		expected string
+	}{
+		{
+			name: "application error code",
+			frame: &ConnectionCloseFrame{
 				IsApplicationError: true,
 				ErrorCode:          1337,
 				ReasonPhrase:       "lorem ipsum",
 			},
-			map[string]interface{}{
-				"frame_type":     "connection_close",
-				"error_space":    "application",
-				"error_code":     1337,
-				"raw_error_code": 1337,
-				"reason":         "lorem ipsum",
+			expected: `{
+				"frame_type": "connection_close",
+				"error_space": "application",
+				"error": "unknown",
+				"error_code": 1337,
+				"reason": "lorem ipsum"
+			}`,
+		},
+		{
+			name: "application error code that is also a transport error code",
+			frame: &ConnectionCloseFrame{
+				IsApplicationError: true,
+				ErrorCode:          0,
 			},
-		)
-	})
-
-	It("marshals CONNECTION_CLOSE frames, for transport error codes", func() {
-		check(
-			&logging.ConnectionCloseFrame{
+			expected: `{
+				"frame_type": "connection_close",
+				"error_space": "application",
+				"error": "unknown",
+				"error_code": 0,
+				"reason": ""
+			}`,
+		},
+		{
+			name: "transport error code",
+			frame: &ConnectionCloseFrame{
 				ErrorCode:    uint64(qerr.FlowControlError),
+				FrameType:    0xa,
 				ReasonPhrase: "lorem ipsum",
 			},
-			map[string]interface{}{
-				"frame_type":     "connection_close",
-				"error_space":    "transport",
-				"error_code":     "flow_control_error",
-				"raw_error_code": int(qerr.FlowControlError),
-				"reason":         "lorem ipsum",
+			expected: `{
+				"frame_type": "connection_close",
+				"error_space": "transport",
+				"error": "flow_control_error",
+				"reason": "lorem ipsum",
+				"trigger_frame_type": "stream"
+			}`,
+		},
+		{
+			name: "unknown transport error code",
+			frame: &ConnectionCloseFrame{
+				ErrorCode: 0x42,
+				FrameType: 0x42,
 			},
-		)
-	})
+			expected: `{
+				"frame_type": "connection_close",
+				"error_space": "transport",
+				"error": "unknown",
+				"error_code": 66,
+				"reason": "",
+				"trigger_frame_type": 66
+			}`,
+		},
+		{
+			name: "crypto error",
+			frame: &ConnectionCloseFrame{
+				ErrorCode: 0x12a,
+				FrameType: uint64(wire.FrameTypeCrypto),
+			},
+			expected: `{
+				"frame_type": "connection_close",
+				"error_space": "transport",
+				"error": "crypto_error_0x12a",
+				"reason": "",
+				"trigger_frame_type": "crypto"
+			}`,
+		},
+		{
+			name: "reason that is not UTF-8",
+			frame: &ConnectionCloseFrame{
+				ErrorCode:    uint64(qerr.ProtocolViolation),
+				ReasonPhrase: "foo\xffbar",
+			},
+			expected: `{
+				"frame_type": "connection_close",
+				"error_space": "transport",
+				"error": "protocol_violation",
+				"reason_bytes": "666f6fff626172"
+			}`,
+		},
+	}
 
-	It("marshals HANDSHAKE_DONE frames", func() {
-		check(
-			&logging.HandshakeDoneFrame{},
-			map[string]interface{}{
-				"frame_type": "handshake_done",
-			},
-		)
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			check(t, tt.frame, tt.expected)
+		})
+	}
+}
 
-	It("marshals DATAGRAM frames", func() {
-		check(
-			&logging.DatagramFrame{Length: 1337},
-			map[string]interface{}{
-				"frame_type": "datagram",
-				"length":     1337,
-			},
-		)
-	})
-})
+func TestHandshakeDoneFrame(t *testing.T) {
+	check(t,
+		&HandshakeDoneFrame{},
+		`{
+			"frame_type": "handshake_done"
+		}`,
+	)
+}
+
+func TestDatagramFrame(t *testing.T) {
+	check(t,
+		&DatagramFrame{Length: 1337},
+		`{
+			"frame_type": "datagram",
+			"length": 1337
+		}`,
+	)
+}

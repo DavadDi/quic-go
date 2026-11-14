@@ -1,47 +1,37 @@
 package wire
 
 import (
-	"bytes"
 	"io"
+	"testing"
 
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/quic-go/quic-go/internal/protocol"
+
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("PATH_RESPONSE frame", func() {
-	Context("when parsing", func() {
-		It("accepts sample frame", func() {
-			b := bytes.NewReader([]byte{0x1b, 1, 2, 3, 4, 5, 6, 7, 8})
-			f, err := parsePathResponseFrame(b, protocol.VersionWhatever)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(b.Len()).To(BeZero())
-			Expect(f.Data).To(Equal([8]byte{1, 2, 3, 4, 5, 6, 7, 8}))
-		})
+func TestParsePathResponse(t *testing.T) {
+	b := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	f, l, err := parsePathResponseFrame(b, protocol.Version1)
+	require.NoError(t, err)
+	require.Equal(t, [8]byte{1, 2, 3, 4, 5, 6, 7, 8}, f.Data)
+	require.Equal(t, len(b), l)
+}
 
-		It("errors on EOFs", func() {
-			data := []byte{0x1b, 1, 2, 3, 4, 5, 6, 7, 8}
-			_, err := parsePathResponseFrame(bytes.NewReader(data), versionIETFFrames)
-			Expect(err).NotTo(HaveOccurred())
-			for i := range data {
-				_, err := parsePathResponseFrame(bytes.NewReader(data[0:i]), versionIETFFrames)
-				Expect(err).To(MatchError(io.EOF))
-			}
-		})
-	})
+func TestParsePathResponseErrorsOnEOFs(t *testing.T) {
+	data := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	_, l, err := parsePathResponseFrame(data, protocol.Version1)
+	require.NoError(t, err)
+	require.Equal(t, len(data), l)
+	for i := range data {
+		_, _, err := parsePathResponseFrame(data[:i], protocol.Version1)
+		require.ErrorIs(t, err, io.EOF)
+	}
+}
 
-	Context("when writing", func() {
-		It("writes a sample frame", func() {
-			b := &bytes.Buffer{}
-			frame := PathResponseFrame{Data: [8]byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0x13, 0x37}}
-			err := frame.Write(b, protocol.VersionWhatever)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(b.Bytes()).To(Equal([]byte{0x1b, 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0x13, 0x37}))
-		})
-
-		It("has the correct min length", func() {
-			frame := PathResponseFrame{}
-			Expect(frame.Length(protocol.VersionWhatever)).To(Equal(protocol.ByteCount(9)))
-		})
-	})
-})
+func TestWritePathResponse(t *testing.T) {
+	frame := PathResponseFrame{Data: [8]byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0x13, 0x37}}
+	b, err := frame.Append(nil, protocol.Version1)
+	require.NoError(t, err)
+	require.Equal(t, []byte{byte(FrameTypePathResponse), 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0x13, 0x37}, b)
+	require.Len(t, b, int(frame.Length(protocol.Version1)))
+}

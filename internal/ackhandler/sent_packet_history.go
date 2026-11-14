@@ -2,107 +2,264 @@ package ackhandler
 
 import (
 	"fmt"
-	"time"
+	"iter"
+	"slices"
 
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/internal/utils"
+	"github.com/quic-go/quic-go/internal/protocol"
 )
 
+const maxSkippedPackets = 4
+
 type sentPacketHistory struct {
-	rttStats    *utils.RTTStats
-	packetList  *PacketList
-	packetMap   map[protocol.PacketNumber]*PacketElement
-	highestSent protocol.PacketNumber
+	packets          []*packet
+	pathProbePackets []packetWithPacketNumber
+	skippedPackets   []protocol.PacketNumber
+
+	numOutstanding int
+
+	firstPacketNumber   protocol.PacketNumber
+	highestPacketNumber protocol.PacketNumber
 }
 
-func newSentPacketHistory(rttStats *utils.RTTStats) *sentPacketHistory {
+func newSentPacketHistory() *sentPacketHistory {
 	return &sentPacketHistory{
-		rttStats:    rttStats,
-		packetList:  NewPacketList(),
-		packetMap:   make(map[protocol.PacketNumber]*PacketElement),
-		highestSent: protocol.InvalidPacketNumber,
+		packets:             make([]*packet, 0, 32),
+		skippedPackets:      make([]protocol.PacketNumber, 0, maxSkippedPackets),
+		highestPacketNumber: protocol.InvalidPacketNumber,
+		firstPacketNumber:   protocol.InvalidPacketNumber,
 	}
 }
 
-func (h *sentPacketHistory) SentPacket(p *Packet, isAckEliciting bool) {
-	if p.PacketNumber <= h.highestSent {
-		panic("non-sequential packet number use")
-	}
-	// Skipped packet numbers.
-	for pn := h.highestSent + 1; pn < p.PacketNumber; pn++ {
-		el := h.packetList.PushBack(Packet{
-			PacketNumber:    pn,
-			EncryptionLevel: p.EncryptionLevel,
-			SendTime:        p.SendTime,
-			skippedPacket:   true,
-		})
-		h.packetMap[pn] = el
-	}
-	h.highestSent = p.PacketNumber
-
-	if isAckEliciting {
-		el := h.packetList.PushBack(*p)
-		h.packetMap[p.PacketNumber] = el
-	}
-}
-
-// Iterate iterates through all packets.
-func (h *sentPacketHistory) Iterate(cb func(*Packet) (cont bool, err error)) error {
-	cont := true
-	var next *PacketElement
-	for el := h.packetList.Front(); cont && el != nil; el = next {
-		var err error
-		next = el.Next()
-		cont, err = cb(&el.Value)
-		if err != nil {
-			return err
+func (h *sentPacketHistory) checkPacketNumberUse(pn protocol.PacketNumber) {
+	if h.highestPacketNumber != protocol.InvalidPacketNumber {
+		if pn <= h.highestPacketNumber {
+			panic("non-increasing packet number use")
 		}
 	}
-	return nil
+	if len(h.packets) > 0 {
+		h.packets = append(h.packets, make([]*packet, pn-h.highestPacketNumber-1)...)
+	}
+	h.highestPacketNumber = pn
+	if len(h.packets) == 0 {
+		h.firstPacketNumber = pn
+	}
 }
 
-// FirstOutStanding returns the first outstanding packet.
-func (h *sentPacketHistory) FirstOutstanding() *Packet {
-	for el := h.packetList.Front(); el != nil; el = el.Next() {
-		p := &el.Value
-		if !p.declaredLost && !p.skippedPacket && !p.IsPathMTUProbePacket {
-			return p
+func (h *sentPacketHistory) SkippedPacket(pn protocol.PacketNumber) {
+	if len(h.skippedPackets) == maxSkippedPackets {
+		h.skippedPackets = slices.Delete(h.skippedPackets, 0, 1)
+	}
+	h.skippedPackets = append(h.skippedPackets, pn)
+}
+
+func (h *sentPacketHistory) SentPacket(pn protocol.PacketNumber, p *packet) {
+	h.checkPacketNumberUse(pn)
+	h.packets = append(h.packets, p)
+	if p.Outstanding() {
+		h.numOutstanding++
+	}
+}
+
+func (h *sentPacketHistory) SentPathProbePacket(pn protocol.PacketNumber, p *packet) {
+	h.checkPacketNumberUse(pn)
+	h.packets = append(h.packets, &packet{EncryptionLevel: p.EncryptionLevel, isPathProbePacket: true})
+	h.pathProbePackets = append(h.pathProbePackets, packetWithPacketNumber{PacketNumber: pn, packet: p})
+}
+
+func (h *sentPacketHistory) Packets() iter.Seq2[protocol.PacketNumber, *packet] {
+	return func(yield func(protocol.PacketNumber, *packet) bool) {
+		// h.firstPacketNumber might be updated in the yield function,
+		// so we need to save it here.
+		firstPacketNumber := h.firstPacketNumber
+		for i, p := range h.packets {
+			if p == nil {
+				continue
+			}
+			if !yield(firstPacketNumber+protocol.PacketNumber(i), p) {
+				return
+			}
 		}
 	}
-	return nil
+}
+
+func (h *sentPacketHistory) PathProbes() iter.Seq2[protocol.PacketNumber, *packet] {
+	return func(yield func(protocol.PacketNumber, *packet) bool) {
+		for _, p := range h.pathProbePackets {
+			if !yield(p.PacketNumber, p.packet) {
+				return
+			}
+		}
+	}
+}
+
+// FirstOutstanding returns the first outstanding packet in the given packet number space.
+func (h *sentPacketHistory) FirstOutstanding(space protocol.PacketNumberSpace) (protocol.PacketNumber, *packet) {
+	if !h.HasOutstandingPackets() {
+		return protocol.InvalidPacketNumber, nil
+	}
+	for i, p := range h.packets {
+		if p != nil && p.Outstanding() && p.EncryptionLevel.PacketNumberSpace() == space {
+			return h.firstPacketNumber + protocol.PacketNumber(i), p
+		}
+	}
+	return protocol.InvalidPacketNumber, nil
+}
+
+// FirstOutstandingPathProbe returns the first outstanding path probe packet
+func (h *sentPacketHistory) FirstOutstandingPathProbe() (protocol.PacketNumber, *packet) {
+	if len(h.pathProbePackets) == 0 {
+		return protocol.InvalidPacketNumber, nil
+	}
+	return h.pathProbePackets[0].PacketNumber, h.pathProbePackets[0].packet
+}
+
+func (h *sentPacketHistory) SkippedPackets() iter.Seq[protocol.PacketNumber] {
+	return func(yield func(protocol.PacketNumber) bool) {
+		for _, p := range h.skippedPackets {
+			if !yield(p) {
+				return
+			}
+		}
+	}
 }
 
 func (h *sentPacketHistory) Len() int {
-	return len(h.packetMap)
+	return len(h.packets)
 }
 
-func (h *sentPacketHistory) Remove(p protocol.PacketNumber) error {
-	el, ok := h.packetMap[p]
+func (h *sentPacketHistory) NumOutstanding() int {
+	return h.numOutstanding
+}
+
+// Remove removes a packet from the sent packet history.
+// It must not be used for skipped packet numbers.
+func (h *sentPacketHistory) Remove(pn protocol.PacketNumber) error {
+	idx, ok := h.getIndex(pn)
 	if !ok {
-		return fmt.Errorf("packet %d not found in sent packet history", p)
+		return fmt.Errorf("packet %d not found in sent packet history", pn)
 	}
-	h.packetList.Remove(el)
-	delete(h.packetMap, p)
+	p := h.packets[idx]
+	if p.Outstanding() {
+		h.numOutstanding--
+		if h.numOutstanding < 0 {
+			panic("negative number of outstanding packets")
+		}
+	}
+	h.packets[idx] = nil
+	// clean up all skipped packets directly before this packet number
+	var hasPacketBefore bool
+	for idx > 0 {
+		idx--
+		if h.packets[idx] != nil {
+			hasPacketBefore = true
+			break
+		}
+	}
+	if !hasPacketBefore {
+		h.cleanupStart()
+	}
+	if len(h.packets) > 0 && h.packets[0] == nil {
+		panic("cleanup failed")
+	}
 	return nil
 }
 
-func (h *sentPacketHistory) HasOutstandingPackets() bool {
-	return h.FirstOutstanding() != nil
-}
-
-func (h *sentPacketHistory) DeleteOldPackets(now time.Time) {
-	maxAge := 3 * h.rttStats.PTO(false)
-	var nextEl *PacketElement
-	for el := h.packetList.Front(); el != nil; el = nextEl {
-		nextEl = el.Next()
-		p := el.Value
-		if p.SendTime.After(now.Add(-maxAge)) {
+// RemovePathProbe removes a path probe packet.
+// It scales O(N), but that's ok, since we don't expect to send many path probe packets.
+// It is not valid to call this function in IteratePathProbes.
+func (h *sentPacketHistory) RemovePathProbe(pn protocol.PacketNumber) *packet {
+	var packetToDelete *packet
+	idx := -1
+	for i, p := range h.pathProbePackets {
+		if p.PacketNumber == pn {
+			packetToDelete = p.packet
+			idx = i
 			break
 		}
-		if !p.skippedPacket && !p.declaredLost { // should only happen in the case of drastic RTT changes
-			continue
-		}
-		delete(h.packetMap, p.PacketNumber)
-		h.packetList.Remove(el)
 	}
+	if idx != -1 {
+		// don't use slices.Delete, because it zeros the deleted element
+		copy(h.pathProbePackets[idx:], h.pathProbePackets[idx+1:])
+		h.pathProbePackets = h.pathProbePackets[:len(h.pathProbePackets)-1]
+	}
+	return packetToDelete
+}
+
+// getIndex gets the index of packet p in the packets slice.
+func (h *sentPacketHistory) getIndex(p protocol.PacketNumber) (int, bool) {
+	if len(h.packets) == 0 {
+		return 0, false
+	}
+	if p < h.firstPacketNumber {
+		return 0, false
+	}
+	index := int(p - h.firstPacketNumber)
+	if index > len(h.packets)-1 {
+		return 0, false
+	}
+	return index, true
+}
+
+func (h *sentPacketHistory) HasOutstandingPackets() bool {
+	return h.numOutstanding > 0
+}
+
+func (h *sentPacketHistory) FirstPacketNumber() protocol.PacketNumber {
+	return h.firstPacketNumber
+}
+
+func (h *sentPacketHistory) HasOutstandingPathProbes() bool {
+	return len(h.pathProbePackets) > 0
+}
+
+// delete all nil entries at the beginning of the packets slice
+func (h *sentPacketHistory) cleanupStart() {
+	for i, p := range h.packets {
+		if p != nil {
+			h.packets = h.packets[i:]
+			h.firstPacketNumber += protocol.PacketNumber(i)
+			return
+		}
+	}
+	h.packets = h.packets[:0]
+	h.firstPacketNumber = protocol.InvalidPacketNumber
+}
+
+func (h *sentPacketHistory) DeclareLost(pn protocol.PacketNumber) {
+	idx, ok := h.getIndex(pn)
+	if !ok {
+		return
+	}
+	p := h.packets[idx]
+	if p.Outstanding() {
+		h.numOutstanding--
+		if h.numOutstanding < 0 {
+			panic("negative number of outstanding packets")
+		}
+	}
+	h.packets[idx] = nil
+	if idx == 0 {
+		h.cleanupStart()
+	}
+}
+
+// Difference returns the difference between two packet numbers a and b (a - b),
+// taking into account any skipped packet numbers between them.
+//
+// Note that old skipped packets are garbage collected at some point,
+// so this function is not guaranteed to return the correct result after a while.
+func (h *sentPacketHistory) Difference(a, b protocol.PacketNumber) protocol.PacketNumber {
+	diff := a - b
+	if len(h.skippedPackets) == 0 {
+		return diff
+	}
+	if a < h.skippedPackets[0] || b > h.skippedPackets[len(h.skippedPackets)-1] {
+		return diff
+	}
+	for _, p := range h.skippedPackets {
+		if p > b && p < a {
+			diff--
+		}
+	}
+	return diff
 }

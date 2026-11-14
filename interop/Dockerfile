@@ -1,26 +1,34 @@
-FROM martenseemann/quic-network-simulator-endpoint:latest AS builder
+# build on the native platform and cross-compile
+FROM --platform=$BUILDPLATFORM martenseemann/quic-network-simulator-endpoint:latest AS builder
 
-RUN apt-get update && apt-get install -y wget tar git
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
+RUN echo "BUILDPLATFORM: ${BUILDPLATFORM}, TARGETPLATFORM: ${TARGETPLATFORM}"
 
-RUN wget https://dl.google.com/go/go1.17.linux-amd64.tar.gz && \
-  tar xfz go1.17.linux-amd64.tar.gz && \
-  rm go1.17.linux-amd64.tar.gz
+RUN apt-get update && apt-get install -y wget tar git && rm -rf /var/lib/apt/lists/*
+
+ENV GOVERSION=1.27.0
+
+RUN platform=$(echo ${BUILDPLATFORM} | tr '/' '-') && \
+  filename="go${GOVERSION}.${platform}.tar.gz" && \
+  wget https://dl.google.com/go/${filename} && \
+  tar xfz ${filename} && \
+  rm ${filename}
 
 ENV PATH="/go/bin:${PATH}"
+ENV GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0
 
 # build with --build-arg CACHEBUST=$(date +%s)
 ARG CACHEBUST=1
 
-RUN git clone https://github.com/lucas-clemente/quic-go && \
-  cd quic-go && \
-  git fetch origin interop && git checkout -t origin/interop && \
-  go get ./...
-
+COPY . /quic-go
 WORKDIR /quic-go
 
-RUN git rev-parse HEAD > commit.txt
-RUN go build -o server -ldflags="-X github.com/lucas-clemente/quic-go/qlog.quicGoVersion=$(git describe --always --long --dirty)" interop/server/main.go
-RUN go build -o client -ldflags="-X github.com/lucas-clemente/quic-go/qlog.quicGoVersion=$(git describe --always --long --dirty)" interop/client/main.go
+RUN git rev-parse HEAD | tee commit.txt
+RUN go build -o server -ldflags="-X github.com/quic-go/quic-go/qlog.quicGoVersion=$(git describe --always --long --dirty)" interop/server/main.go
+RUN go build -o client -ldflags="-X github.com/quic-go/quic-go/qlog.quicGoVersion=$(git describe --always --long --dirty)" interop/client/main.go
 
 
 FROM martenseemann/quic-network-simulator-endpoint:latest
@@ -28,8 +36,6 @@ FROM martenseemann/quic-network-simulator-endpoint:latest
 WORKDIR /quic-go
 
 COPY --from=builder /quic-go/commit.txt /quic-go/server /quic-go/client ./
-
-COPY run_endpoint.sh .
-RUN chmod +x run_endpoint.sh
+COPY --from=builder --chmod=755 /quic-go/interop/run_endpoint.sh ./
 
 ENTRYPOINT [ "./run_endpoint.sh" ]

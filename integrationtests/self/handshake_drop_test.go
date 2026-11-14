@@ -1,251 +1,412 @@
 package self_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
-	mrand "math/rand"
+	mrand "math/rand/v2"
 	"net"
+	"slices"
+	"sync"
 	"sync/atomic"
+	"testing"
+	"testing/synctest"
 	"time"
 
-	quic "github.com/lucas-clemente/quic-go"
-	quicproxy "github.com/lucas-clemente/quic-go/integrationtests/tools/proxy"
-	"github.com/lucas-clemente/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/testutils/events"
+	"github.com/quic-go/quic-go/testutils/simnet"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-	"github.com/onsi/gomega/gbytes"
+	"github.com/stretchr/testify/require"
 )
 
-var directions = []quicproxy.Direction{quicproxy.DirectionIncoming, quicproxy.DirectionOutgoing, quicproxy.DirectionBoth}
+func dropTestProtocolClientSpeaksFirst(t *testing.T, ln *quic.Listener, clientConn net.PacketConn, clientConf *tls.Config, timeout time.Duration, data []byte) *quic.Conn {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	conn, err := quic.Dial(
+		ctx,
+		clientConn,
+		ln.Addr(),
+		clientConf,
+		getQuicConfig(&quic.Config{
+			MaxIdleTimeout:          timeout,
+			HandshakeIdleTimeout:    timeout,
+			DisablePathMTUDiscovery: true,
+		}),
+	)
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "")
 
-type applicationProtocol struct {
-	name string
-	run  func(protocol.VersionNumber)
+	str, err := conn.OpenUniStream()
+	require.NoError(t, err)
+	errChan := make(chan error, 1)
+	go func() {
+		defer str.Close()
+		_, err := str.Write(data)
+		errChan <- err
+	}()
+
+	serverConn, err := ln.Accept(ctx)
+	require.NoError(t, err)
+	serverStr, err := serverConn.AcceptUniStream(ctx)
+	require.NoError(t, err)
+	b, err := io.ReadAll(&readerWithTimeout{Reader: serverStr, Timeout: timeout})
+	require.NoError(t, err)
+	require.Equal(t, b, data)
+	serverConn.CloseWithError(0, "")
+
+	return conn
 }
 
-var _ = Describe("Handshake drop tests", func() {
-	var (
-		proxy *quicproxy.QuicProxy
-		ln    quic.Listener
+func dropTestProtocolServerSpeaksFirst(t *testing.T, ln *quic.Listener, clientConn net.PacketConn, clientConf *tls.Config, timeout time.Duration, data []byte) *quic.Conn {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	conn, err := quic.Dial(
+		ctx,
+		clientConn,
+		ln.Addr(),
+		clientConf,
+		getQuicConfig(&quic.Config{
+			MaxIdleTimeout:          timeout,
+			HandshakeIdleTimeout:    timeout,
+			DisablePathMTUDiscovery: true,
+		}),
 	)
+	require.NoError(t, err)
 
-	data := GeneratePRData(5000)
-	const timeout = 2 * time.Minute
-
-	startListenerAndProxy := func(dropCallback quicproxy.DropCallback, doRetry bool, longCertChain bool, version protocol.VersionNumber) {
-		conf := getQuicConfig(&quic.Config{
-			MaxIdleTimeout:       timeout,
-			HandshakeIdleTimeout: timeout,
-			Versions:             []protocol.VersionNumber{version},
-		})
-		if !doRetry {
-			conf.AcceptToken = func(net.Addr, *quic.Token) bool { return true }
+	errChan := make(chan error, 1)
+	go func() {
+		defer close(errChan)
+		defer conn.CloseWithError(0, "")
+		str, err := conn.AcceptUniStream(ctx)
+		if err != nil {
+			errChan <- err
+			return
 		}
-		var tlsConf *tls.Config
-		if longCertChain {
-			tlsConf = getTLSConfigWithLongCertChain()
-		} else {
-			tlsConf = getTLSConfig()
+		b, err := io.ReadAll(&readerWithTimeout{Reader: str, Timeout: timeout})
+		if err != nil {
+			errChan <- err
+			return
 		}
-		var err error
-		ln, err = quic.ListenAddr("localhost:0", tlsConf, conf)
-		Expect(err).ToNot(HaveOccurred())
-		serverPort := ln.Addr().(*net.UDPAddr).Port
-		proxy, err = quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-			RemoteAddr: fmt.Sprintf("localhost:%d", serverPort),
-			DropPacket: dropCallback,
-			DelayPacket: func(dir quicproxy.Direction, packet []byte) time.Duration {
-				return 10 * time.Millisecond
-			},
-		})
-		Expect(err).ToNot(HaveOccurred())
+		if !bytes.Equal(b, data) {
+			errChan <- fmt.Errorf("data mismatch: %x != %x", b, data)
+			return
+		}
+	}()
+
+	serverConn, err := ln.Accept(ctx)
+	require.NoError(t, err)
+	serverStr, err := serverConn.OpenUniStream()
+	require.NoError(t, err)
+	_, err = serverStr.Write(data)
+	require.NoError(t, err)
+	require.NoError(t, serverStr.Close())
+
+	select {
+	case err := <-errChan:
+		require.NoError(t, err)
+	case <-time.After(timeout):
+		t.Fatal("server connection not closed")
 	}
 
-	stochasticDropper := func(freq int) bool {
-		return mrand.Int63n(int64(freq)) == 0
+	select {
+	case <-conn.Context().Done():
+	case <-time.After(timeout):
+		t.Fatal("server connection not closed")
 	}
 
-	clientSpeaksFirst := &applicationProtocol{
-		name: "client speaks first",
-		run: func(version protocol.VersionNumber) {
-			serverSessionChan := make(chan quic.Session)
-			go func() {
-				defer GinkgoRecover()
-				sess, err := ln.Accept(context.Background())
-				Expect(err).ToNot(HaveOccurred())
-				defer sess.CloseWithError(0, "")
-				str, err := sess.AcceptStream(context.Background())
-				Expect(err).ToNot(HaveOccurred())
-				b, err := io.ReadAll(gbytes.TimeoutReader(str, timeout))
-				Expect(err).ToNot(HaveOccurred())
-				Expect(b).To(Equal(data))
-				serverSessionChan <- sess
-			}()
-			sess, err := quic.DialAddr(
-				fmt.Sprintf("localhost:%d", proxy.LocalPort()),
-				getTLSClientConfig(),
-				getQuicConfig(&quic.Config{
-					MaxIdleTimeout:       timeout,
-					HandshakeIdleTimeout: timeout,
-					Versions:             []protocol.VersionNumber{version},
-				}),
-			)
-			Expect(err).ToNot(HaveOccurred())
-			str, err := sess.OpenStream()
-			Expect(err).ToNot(HaveOccurred())
-			_, err = str.Write(data)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(str.Close()).To(Succeed())
+	return conn
+}
 
-			var serverSession quic.Session
-			Eventually(serverSessionChan, timeout).Should(Receive(&serverSession))
-			sess.CloseWithError(0, "")
-			serverSession.CloseWithError(0, "")
-		},
+func dropTestProtocolNobodySpeaks(t *testing.T, ln *quic.Listener, clientConn net.PacketConn, clientConf *tls.Config, timeout time.Duration, _ []byte) *quic.Conn {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	conn, err := quic.Dial(
+		ctx,
+		clientConn,
+		ln.Addr(),
+		clientConf,
+		getQuicConfig(&quic.Config{
+			MaxIdleTimeout:          timeout,
+			HandshakeIdleTimeout:    timeout,
+			DisablePathMTUDiscovery: true,
+		}),
+	)
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "")
+
+	serverConn, err := ln.Accept(ctx)
+	require.NoError(t, err)
+	serverConn.CloseWithError(0, "")
+
+	return conn
+}
+
+func dropCallbackDropNthPacket(dir direction, ns ...int) func(direction, simnet.Packet) bool {
+	var toClient, toServer atomic.Int32
+	return func(d direction, p simnet.Packet) bool {
+		switch d {
+		case directionToClient:
+			c := toClient.Add(1)
+			if d == dir || dir == directionBoth {
+				return slices.Contains(ns, int(c))
+			}
+		case directionToServer:
+			c := toServer.Add(1)
+			if dir == d || dir == directionBoth {
+				return slices.Contains(ns, int(c))
+			}
+		}
+		return false
 	}
+}
 
-	serverSpeaksFirst := &applicationProtocol{
-		name: "server speaks first",
-		run: func(version protocol.VersionNumber) {
-			serverSessionChan := make(chan quic.Session)
-			go func() {
-				defer GinkgoRecover()
-				sess, err := ln.Accept(context.Background())
-				Expect(err).ToNot(HaveOccurred())
-				str, err := sess.OpenStream()
-				Expect(err).ToNot(HaveOccurred())
-				_, err = str.Write(data)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(str.Close()).To(Succeed())
-				serverSessionChan <- sess
-			}()
-			sess, err := quic.DialAddr(
-				fmt.Sprintf("localhost:%d", proxy.LocalPort()),
-				getTLSClientConfig(),
-				getQuicConfig(&quic.Config{
-					MaxIdleTimeout:       timeout,
-					HandshakeIdleTimeout: timeout,
-					Versions:             []protocol.VersionNumber{version},
-				}),
-			)
-			Expect(err).ToNot(HaveOccurred())
-			str, err := sess.AcceptStream(context.Background())
-			Expect(err).ToNot(HaveOccurred())
-			b, err := io.ReadAll(gbytes.TimeoutReader(str, timeout))
-			Expect(err).ToNot(HaveOccurred())
-			Expect(b).To(Equal(data))
+func dropCallbackDropOneThird(dir direction) func(direction, simnet.Packet) bool {
+	const maxSequentiallyDropped = 10
+	var mx sync.Mutex
+	var toClient, toServer int
+	return func(d direction, p simnet.Packet) bool {
+		if d != dir && dir != directionBoth {
+			return false
+		}
+		drop := mrand.IntN(3) == 0
 
-			var serverSession quic.Session
-			Eventually(serverSessionChan, timeout).Should(Receive(&serverSession))
-			sess.CloseWithError(0, "")
-			serverSession.CloseWithError(0, "")
-		},
-	}
-
-	nobodySpeaks := &applicationProtocol{
-		name: "nobody speaks",
-		run: func(version protocol.VersionNumber) {
-			serverSessionChan := make(chan quic.Session)
-			go func() {
-				defer GinkgoRecover()
-				sess, err := ln.Accept(context.Background())
-				Expect(err).ToNot(HaveOccurred())
-				serverSessionChan <- sess
-			}()
-			sess, err := quic.DialAddr(
-				fmt.Sprintf("localhost:%d", proxy.LocalPort()),
-				getTLSClientConfig(),
-				getQuicConfig(&quic.Config{
-					MaxIdleTimeout:       timeout,
-					HandshakeIdleTimeout: timeout,
-					Versions:             []protocol.VersionNumber{version},
-				}),
-			)
-			Expect(err).ToNot(HaveOccurred())
-			var serverSession quic.Session
-			Eventually(serverSessionChan, timeout).Should(Receive(&serverSession))
-			// both server and client accepted a session. Close now.
-			sess.CloseWithError(0, "")
-			serverSession.CloseWithError(0, "")
-		},
-	}
-
-	AfterEach(func() {
-		Expect(ln.Close()).To(Succeed())
-		Expect(proxy.Close()).To(Succeed())
-	})
-
-	for _, v := range protocol.SupportedVersions {
-		version := v
-
-		Context(fmt.Sprintf("with QUIC version %s", version), func() {
-			for _, d := range directions {
-				direction := d
-
-				for _, dr := range []bool{true, false} {
-					doRetry := dr
-					desc := "when using Retry"
-					if !dr {
-						desc = "when not using Retry"
-					}
-
-					Context(desc, func() {
-						for _, lcc := range []bool{false, true} {
-							longCertChain := lcc
-
-							Context(fmt.Sprintf("using a long certificate chain: %t", longCertChain), func() {
-								for _, a := range []*applicationProtocol{clientSpeaksFirst, serverSpeaksFirst, nobodySpeaks} {
-									app := a
-
-									Context(app.name, func() {
-										It(fmt.Sprintf("establishes a connection when the first packet is lost in %s direction", direction), func() {
-											var incoming, outgoing int32
-											startListenerAndProxy(func(d quicproxy.Direction, _ []byte) bool {
-												var p int32
-												//nolint:exhaustive
-												switch d {
-												case quicproxy.DirectionIncoming:
-													p = atomic.AddInt32(&incoming, 1)
-												case quicproxy.DirectionOutgoing:
-													p = atomic.AddInt32(&outgoing, 1)
-												}
-												return p == 1 && d.Is(direction)
-											}, doRetry, longCertChain, version)
-											app.run(version)
-										})
-
-										It(fmt.Sprintf("establishes a connection when the second packet is lost in %s direction", direction), func() {
-											var incoming, outgoing int32
-											startListenerAndProxy(func(d quicproxy.Direction, _ []byte) bool {
-												var p int32
-												//nolint:exhaustive
-												switch d {
-												case quicproxy.DirectionIncoming:
-													p = atomic.AddInt32(&incoming, 1)
-												case quicproxy.DirectionOutgoing:
-													p = atomic.AddInt32(&outgoing, 1)
-												}
-												return p == 2 && d.Is(direction)
-											}, doRetry, longCertChain, version)
-											app.run(version)
-										})
-
-										It(fmt.Sprintf("establishes a connection when 1/3 of the packets are lost in %s direction", direction), func() {
-											startListenerAndProxy(func(d quicproxy.Direction, _ []byte) bool {
-												return d.Is(direction) && stochasticDropper(3)
-											}, doRetry, longCertChain, version)
-											app.run(version)
-										})
-									})
-								}
-							})
-						}
-					})
+		mx.Lock()
+		defer mx.Unlock()
+		// never drop more than 10 consecutive packets
+		if d == directionToClient || d == directionBoth {
+			if drop {
+				toClient++
+				if toClient > maxSequentiallyDropped {
+					drop = false
 				}
 			}
-		})
+			if !drop {
+				toClient = 0
+			}
+		}
+		if d == directionToServer || d == directionBoth {
+			if drop {
+				toServer++
+				if toServer > maxSequentiallyDropped {
+					drop = false
+				}
+			}
+			if !drop {
+				toServer = 0
+			}
+		}
+		return drop
 	}
-})
+}
+
+func TestHandshakeWithPacketLoss(t *testing.T) {
+	data := GeneratePRData(5000)
+	const timeout = 2 * time.Minute
+	const rtt = 20 * time.Millisecond
+
+	type dropPattern string
+
+	const (
+		dropPatternDrop1stPacket         dropPattern = "drop 1st packet"
+		dropPatternDropFirst3Packets     dropPattern = "drop first 3 packets"
+		dropPatternDropOneThirdOfPackets dropPattern = "drop 1/3 of packets"
+	)
+
+	type testConfig struct {
+		postQuantum   bool
+		longCertChain bool
+		doRetry       bool
+	}
+
+	for _, dir := range []direction{directionToClient, directionToServer, directionBoth} {
+		for _, pattern := range []dropPattern{
+			dropPatternDrop1stPacket,
+			dropPatternDropFirst3Packets,
+			dropPatternDropOneThirdOfPackets,
+		} {
+			t.Run(fmt.Sprintf("%s in direction %s", pattern, dir), func(t *testing.T) {
+				for _, conf := range []testConfig{
+					{postQuantum: false, longCertChain: false, doRetry: true},
+					{postQuantum: false, longCertChain: false, doRetry: false},
+					{postQuantum: false, longCertChain: true, doRetry: false},
+					{postQuantum: true, longCertChain: false, doRetry: false},
+					{postQuantum: true, longCertChain: true, doRetry: false},
+				} {
+					for _, test := range []struct {
+						name string
+						fn   func(t *testing.T, ln *quic.Listener, clientConn net.PacketConn, clientConf *tls.Config, timeout time.Duration, data []byte) *quic.Conn
+					}{
+						{"client speaks first", dropTestProtocolClientSpeaksFirst},
+						{"server speaks first", dropTestProtocolServerSpeaksFirst},
+						{"nobody speaks", dropTestProtocolNobodySpeaks},
+					} {
+						t.Run(fmt.Sprintf("retry: %t/%s", conf.doRetry, test.name), func(t *testing.T) {
+							synctest.Test(t, func(t *testing.T) {
+								clientAddr := &net.UDPAddr{IP: net.ParseIP("1.0.0.1"), Port: 9001}
+								serverAddr := &net.UDPAddr{IP: net.ParseIP("1.0.0.2"), Port: 9002}
+								var fn func(direction, simnet.Packet) bool
+								switch pattern {
+								case dropPatternDrop1stPacket:
+									fn = dropCallbackDropNthPacket(dir, 1)
+								case dropPatternDropFirst3Packets:
+									fn = dropCallbackDropNthPacket(dir, 1, 2, 3)
+								case dropPatternDropOneThirdOfPackets:
+									fn = dropCallbackDropOneThird(dir)
+								}
+								var numDropped atomic.Int32
+								n := &simnet.Simnet{
+									Router: &directionAwareDroppingRouter{
+										ClientAddr: clientAddr,
+										ServerAddr: serverAddr,
+										Drop: func(d direction, p simnet.Packet) bool {
+											drop := fn(d, p)
+											if drop {
+												numDropped.Add(1)
+											}
+											return drop
+										},
+									},
+								}
+								settings := simnet.NodeBiDiLinkSettings{Latency: rtt / 2}
+								clientConn := n.NewEndpoint(clientAddr, settings)
+								defer clientConn.Close()
+								serverConn := n.NewEndpoint(serverAddr, settings)
+								defer serverConn.Close()
+								defer n.Close()
+
+								var tlsConf *tls.Config
+								if conf.longCertChain {
+									tlsConf = getTLSConfigWithLongCertChain()
+								} else {
+									tlsConf = getTLSConfig()
+								}
+								clientConf := getTLSClientConfig()
+								if !conf.postQuantum {
+									clientConf.CurvePreferences = []tls.CurveID{tls.CurveP384}
+								}
+
+								tr := &quic.Transport{
+									Conn:                serverConn,
+									VerifySourceAddress: func(net.Addr) bool { return conf.doRetry },
+								}
+								defer tr.Close()
+
+								ln, err := tr.Listen(
+									tlsConf,
+									getQuicConfig(&quic.Config{
+										MaxIdleTimeout:          timeout,
+										HandshakeIdleTimeout:    timeout,
+										DisablePathMTUDiscovery: true,
+									}),
+								)
+								require.NoError(t, err)
+								defer ln.Close()
+
+								conn := test.fn(t, ln, clientConn, clientConf, timeout, data)
+								curveID := conn.ConnectionState().TLS.CurveID
+								if conf.postQuantum {
+									require.Equal(t, tls.X25519MLKEM768, curveID)
+								} else {
+									require.Equal(t, tls.CurveP384, curveID)
+								}
+
+								if pattern != dropPatternDropOneThirdOfPackets {
+									require.NotZero(t, numDropped.Load())
+								}
+								t.Logf("dropped %d packets", numDropped.Load())
+							})
+						})
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestHandshakePacketBuffering(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const rtt = 20 * time.Millisecond
+
+		clientAddr := &net.UDPAddr{IP: net.ParseIP("1.0.0.1"), Port: 9001}
+		serverAddr := &net.UDPAddr{IP: net.ParseIP("1.0.0.2"), Port: 9002}
+		var droppedFirst atomic.Bool
+		n := &simnet.Simnet{
+			Router: &directionAwareDroppingRouter{
+				ClientAddr: clientAddr,
+				ServerAddr: serverAddr,
+				Drop: func(d direction, p simnet.Packet) bool {
+					if droppedFirst.Load() {
+						return false
+					}
+					if d == directionToClient && containsPacketType(p.Data, protocol.PacketTypeInitial) {
+						droppedFirst.Store(true)
+						return true
+					}
+					return false
+				},
+			},
+		}
+		settings := simnet.NodeBiDiLinkSettings{Latency: rtt / 2}
+		clientConn := n.NewEndpoint(clientAddr, settings)
+		defer clientConn.Close()
+		serverConn := n.NewEndpoint(serverAddr, settings)
+		defer serverConn.Close()
+		defer n.Close()
+
+		var serverEventRecorder events.Recorder
+		ln, err := quic.Listen(
+			serverConn,
+			getTLSConfig(),
+			getQuicConfig(&quic.Config{Tracer: newTracer(&serverEventRecorder)}),
+		)
+		require.NoError(t, err)
+		defer ln.Close()
+
+		var clientEventRecorder events.Recorder
+		conn, err := quic.Dial(
+			context.Background(),
+			clientConn,
+			ln.Addr(),
+			getTLSClientConfig(),
+			getQuicConfig(&quic.Config{Tracer: newTracer(&clientEventRecorder)}),
+		)
+		require.NoError(t, err)
+		defer conn.CloseWithError(0, "")
+		str, err := conn.OpenUniStream()
+		require.NoError(t, err)
+		data := []byte("foobar")
+		_, err = str.Write(data)
+		require.NoError(t, err)
+		require.NoError(t, str.Close())
+
+		require.Empty(t, serverEventRecorder.Events(qlog.PacketBuffered{}))
+		buffered := clientEventRecorder.Events(qlog.PacketBuffered{})
+		t.Logf("buffered packets: %d", len(buffered))
+		require.NotEmpty(t, buffered)
+		receivedPackets := make(map[qlog.DatagramPayloadChecksum][]qlog.PacketType)
+		for _, ev := range clientEventRecorder.Events(qlog.PacketReceived{}) {
+			checksum := ev.(qlog.PacketReceived).DatagramPayloadChecksum
+			receivedPackets[checksum] = append(receivedPackets[checksum], ev.(qlog.PacketReceived).Header.PacketType)
+		}
+		for _, ev := range buffered {
+			checksum := ev.(qlog.PacketBuffered).DatagramPayloadChecksum
+			require.Contains(t, receivedPackets, checksum)
+			require.Contains(t, receivedPackets[checksum], qlog.PacketTypeHandshake)
+		}
+
+		sconn, err := ln.Accept(context.Background())
+		require.NoError(t, err)
+		defer sconn.CloseWithError(0, "")
+		sstr, err := sconn.AcceptUniStream(context.Background())
+		require.NoError(t, err)
+		b, err := io.ReadAll(sstr)
+		require.NoError(t, err)
+		require.Equal(t, data, b)
+		require.Equal(t, rtt, sconn.ConnectionStats().SmoothedRTT)
+	})
+}

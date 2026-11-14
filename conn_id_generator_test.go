@@ -1,187 +1,366 @@
 package quic
 
 import (
-	"fmt"
+	"math/rand/v2"
+	"testing"
+	"time"
 
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/internal/qerr"
-	"github.com/lucas-clemente/quic-go/internal/wire"
+	"github.com/quic-go/quic-go/internal/monotime"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/qerr"
+	"github.com/quic-go/quic-go/internal/wire"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("Connection ID Generator", func() {
-	var (
-		addedConnIDs       []protocol.ConnectionID
-		retiredConnIDs     []protocol.ConnectionID
-		removedConnIDs     []protocol.ConnectionID
-		replacedWithClosed map[string]packetHandler
-		queuedFrames       []wire.Frame
-		g                  *connIDGenerator
-	)
-	initialConnID := protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7}
-	initialClientDestConnID := protocol.ConnectionID{0xa, 0xb, 0xc, 0xd, 0xe}
+// connIDTracker is a connRunner that records the connection IDs it is called with.
+type connIDTracker struct {
+	added, removed, replaced []protocol.ConnectionID
+	handlers                 []packetHandler // the packetHandlers that the connection IDs were added with
+	replacedWith             []byte
+}
 
-	connIDToToken := func(c protocol.ConnectionID) protocol.StatelessResetToken {
-		return protocol.StatelessResetToken{c[0], c[0], c[0], c[0], c[0], c[0], c[0], c[0], c[0], c[0], c[0], c[0], c[0], c[0], c[0], c[0]}
+var _ connRunner = &connIDTracker{}
+
+func (t *connIDTracker) Add(connID protocol.ConnectionID, h packetHandler) bool {
+	t.added = append(t.added, connID)
+	t.handlers = append(t.handlers, h)
+	return true
+}
+
+func (t *connIDTracker) Remove(connID protocol.ConnectionID) { t.removed = append(t.removed, connID) }
+
+func (t *connIDTracker) ReplaceWithClosed(connIDs []protocol.ConnectionID, b []byte, _ time.Duration) {
+	t.replaced = append(t.replaced, connIDs...)
+	t.replacedWith = b
+}
+
+func (t *connIDTracker) AddResetToken(protocol.StatelessResetToken, packetHandler) {}
+func (t *connIDTracker) RemoveResetToken(protocol.StatelessResetToken)             {}
+
+func TestConnIDGeneratorIssueAndRetire(t *testing.T) {
+	t.Run("with initial client destination connection ID", func(t *testing.T) {
+		testConnIDGeneratorIssueAndRetire(t, true)
+	})
+	t.Run("without initial client destination connection ID", func(t *testing.T) {
+		testConnIDGeneratorIssueAndRetire(t, false)
+	})
+}
+
+func testConnIDGeneratorIssueAndRetire(t *testing.T, hasInitialClientDestConnID bool) {
+	var tracker connIDTracker
+	var queuedFrames []wire.Frame
+	sr := newStatelessResetter(&StatelessResetKey{1, 2, 3, 4})
+	var initialClientDestConnID protocol.ConnectionID
+	if hasInitialClientDestConnID {
+		initialClientDestConnID = protocol.ParseConnectionID([]byte{2, 2, 2, 2})
+	}
+	g := newConnIDGenerator(
+		&tracker,
+		protocol.ParseConnectionID([]byte{1, 1, 1, 1}),
+		initialClientDestConnID,
+		sr,
+		&pathReceiver{},
+		func(f wire.Frame) { queuedFrames = append(queuedFrames, f) },
+		&protocol.DefaultConnectionIDGenerator{ConnLen: 5},
+	)
+
+	require.Empty(t, tracker.added)
+	require.NoError(t, g.SetMaxActiveConnIDs(4))
+	require.Len(t, tracker.added, 3)
+	require.Len(t, queuedFrames, 3)
+	require.Empty(t, tracker.removed)
+	connIDs := make(map[uint64]protocol.ConnectionID)
+	// connection IDs 1, 2 and 3 were issued
+	for i, f := range queuedFrames {
+		ncid := f.(*wire.NewConnectionIDFrame)
+		require.EqualValues(t, i+1, ncid.SequenceNumber)
+		require.Equal(t, ncid.ConnectionID, tracker.added[i])
+		require.Equal(t, ncid.StatelessResetToken, sr.GetStatelessResetToken(ncid.ConnectionID))
+		connIDs[ncid.SequenceNumber] = ncid.ConnectionID
 	}
 
-	BeforeEach(func() {
-		addedConnIDs = nil
-		retiredConnIDs = nil
-		removedConnIDs = nil
-		queuedFrames = nil
-		replacedWithClosed = make(map[string]packetHandler)
-		g = newConnIDGenerator(
-			initialConnID,
+	// completing the handshake retires the initial client destination connection ID
+	tracker.added = tracker.added[:0]
+	queuedFrames = queuedFrames[:0]
+	now := monotime.Now()
+	g.SetHandshakeComplete(now)
+	require.Empty(t, tracker.added)
+	require.Empty(t, queuedFrames)
+	require.Empty(t, tracker.removed)
+	g.RemoveRetiredConnIDs(now)
+	if hasInitialClientDestConnID {
+		require.Equal(t, []protocol.ConnectionID{initialClientDestConnID}, tracker.removed)
+		tracker.removed = tracker.removed[:0]
+	} else {
+		require.Empty(t, tracker.removed)
+	}
+
+	// it's invalid to retire a connection ID that hasn't been issued yet
+	err := g.Retire(4, protocol.ParseConnectionID([]byte{3, 3, 3, 3}), monotime.Now())
+	require.ErrorIs(t, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation}, err)
+	require.ErrorContains(t, err, "retired connection ID 4 (highest issued: 3)")
+	// it's invalid to retire a connection ID in a packet that uses that connection ID
+	err = g.Retire(3, connIDs[3], monotime.Now())
+	require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation})
+	require.ErrorContains(t, err, "was used as the Destination Connection ID on this packet")
+
+	// retiring a connection ID makes us issue a new one
+	require.NoError(t, g.Retire(2, protocol.ParseConnectionID([]byte{3, 3, 3, 3}), monotime.Now()))
+	g.RemoveRetiredConnIDs(monotime.Now())
+	require.Equal(t, []protocol.ConnectionID{connIDs[2]}, tracker.removed)
+	require.Len(t, queuedFrames, 1)
+	require.EqualValues(t, 4, queuedFrames[0].(*wire.NewConnectionIDFrame).SequenceNumber)
+	queuedFrames = queuedFrames[:0]
+	tracker.removed = tracker.removed[:0]
+
+	// duplicate retirements don't do anything
+	require.NoError(t, g.Retire(2, protocol.ParseConnectionID([]byte{3, 3, 3, 3}), monotime.Now()))
+	g.RemoveRetiredConnIDs(monotime.Now())
+	require.Empty(t, queuedFrames)
+	require.Empty(t, tracker.removed)
+}
+
+func TestConnIDGeneratorRetiring(t *testing.T) {
+	initialConnID := protocol.ParseConnectionID([]byte{2, 2, 2, 2})
+	var tracker connIDTracker
+	g := newConnIDGenerator(
+		&tracker,
+		protocol.ParseConnectionID([]byte{1, 1, 1, 1}),
+		initialConnID,
+		newStatelessResetter(&StatelessResetKey{1, 2, 3, 4}),
+		&pathReceiver{},
+		func(f wire.Frame) {},
+		&protocol.DefaultConnectionIDGenerator{ConnLen: 5},
+	)
+	require.NoError(t, g.SetMaxActiveConnIDs(6))
+	require.Empty(t, tracker.removed)
+	require.Len(t, tracker.added, 5)
+
+	now := monotime.Now()
+
+	retirements := map[protocol.ConnectionID]monotime.Time{}
+	t1 := now.Add(time.Duration(rand.IntN(1000)) * time.Millisecond)
+	retirements[initialConnID] = t1
+	g.SetHandshakeComplete(t1)
+	for i := range 5 {
+		t2 := now.Add(time.Duration(rand.IntN(1000)) * time.Millisecond)
+		require.NoError(t, g.Retire(uint64(i+1), protocol.ParseConnectionID([]byte{9, 9, 9, 9}), t2))
+		retirements[tracker.added[i]] = t2
+
+		if rand.IntN(2) == 0 {
+			now = now.Add(time.Duration(rand.IntN(500)) * time.Millisecond)
+			g.RemoveRetiredConnIDs(now)
+			for _, r := range tracker.removed {
+				require.Contains(t, retirements, r)
+				require.LessOrEqual(t, retirements[r], now)
+				delete(retirements, r)
+			}
+			tracker.removed = tracker.removed[:0]
+			for _, r := range retirements {
+				require.Greater(t, r, now)
+			}
+		}
+	}
+}
+
+func TestConnIDGeneratorIsInitialClientDestConnID(t *testing.T) {
+	srcConnID := protocol.ParseConnectionID([]byte{1, 1, 1, 1})
+	initialClientDestConnID := protocol.ParseConnectionID([]byte{2, 2, 2, 2})
+
+	t.Run("server", func(t *testing.T) {
+		g := newConnIDGenerator(
+			&connIDTracker{},
+			srcConnID,
 			initialClientDestConnID,
-			func(c protocol.ConnectionID) { addedConnIDs = append(addedConnIDs, c) },
-			connIDToToken,
-			func(c protocol.ConnectionID) { removedConnIDs = append(removedConnIDs, c) },
-			func(c protocol.ConnectionID) { retiredConnIDs = append(retiredConnIDs, c) },
-			func(c protocol.ConnectionID, h packetHandler) { replacedWithClosed[string(c)] = h },
-			func(f wire.Frame) { queuedFrames = append(queuedFrames, f) },
-			protocol.VersionDraft29,
+			newStatelessResetter(&StatelessResetKey{1, 2, 3, 4}),
+			&pathReceiver{},
+			func(f wire.Frame) {},
+			&protocol.DefaultConnectionIDGenerator{ConnLen: 5},
 		)
+		require.True(t, g.IsInitialClientDestConnID(initialClientDestConnID))
+		require.False(t, g.IsInitialClientDestConnID(srcConnID))
+
+		g.SetHandshakeComplete(monotime.Now())
+		require.False(t, g.IsInitialClientDestConnID(initialClientDestConnID))
 	})
 
-	It("issues new connection IDs", func() {
-		Expect(g.SetMaxActiveConnIDs(4)).To(Succeed())
-		Expect(retiredConnIDs).To(BeEmpty())
-		Expect(addedConnIDs).To(HaveLen(3))
-		for i := 0; i < len(addedConnIDs)-1; i++ {
-			Expect(addedConnIDs[i]).ToNot(Equal(addedConnIDs[i+1]))
-		}
-		Expect(queuedFrames).To(HaveLen(3))
-		for i := 0; i < 3; i++ {
-			f := queuedFrames[i]
-			Expect(f).To(BeAssignableToTypeOf(&wire.NewConnectionIDFrame{}))
-			nf := f.(*wire.NewConnectionIDFrame)
-			Expect(nf.SequenceNumber).To(BeEquivalentTo(i + 1))
-			Expect(nf.ConnectionID.Len()).To(Equal(7))
-			Expect(nf.StatelessResetToken).To(Equal(connIDToToken(nf.ConnectionID)))
-		}
+	t.Run("client", func(t *testing.T) {
+		g := newConnIDGenerator(
+			&connIDTracker{},
+			srcConnID,
+			protocol.ConnectionID{},
+			newStatelessResetter(&StatelessResetKey{1, 2, 3, 4}),
+			&pathReceiver{},
+			func(f wire.Frame) {},
+			&protocol.DefaultConnectionIDGenerator{ConnLen: 5},
+		)
+		require.False(t, g.IsInitialClientDestConnID(initialClientDestConnID))
 	})
+}
 
-	It("limits the number of connection IDs that it issues", func() {
-		Expect(g.SetMaxActiveConnIDs(9999999)).To(Succeed())
-		Expect(retiredConnIDs).To(BeEmpty())
-		Expect(addedConnIDs).To(HaveLen(protocol.MaxIssuedConnectionIDs - 1))
-		Expect(queuedFrames).To(HaveLen(protocol.MaxIssuedConnectionIDs - 1))
+func TestConnIDGeneratorRemoveAll(t *testing.T) {
+	t.Run("with initial client destination connection ID", func(t *testing.T) {
+		testConnIDGeneratorRemoveAll(t, true)
 	})
-
-	// SetMaxActiveConnIDs is called twice when we dialing a 0-RTT connection:
-	// once for the restored from the old connections, once when we receive the transport parameters
-	Context("dealing with 0-RTT", func() {
-		It("doesn't issue new connection IDs when SetMaxActiveConnIDs is called with the same value", func() {
-			Expect(g.SetMaxActiveConnIDs(4)).To(Succeed())
-			Expect(queuedFrames).To(HaveLen(3))
-			queuedFrames = nil
-			Expect(g.SetMaxActiveConnIDs(4)).To(Succeed())
-			Expect(queuedFrames).To(BeEmpty())
-		})
-
-		It("issues more connection IDs if the server allows a higher limit on the resumed connection", func() {
-			Expect(g.SetMaxActiveConnIDs(3)).To(Succeed())
-			Expect(queuedFrames).To(HaveLen(2))
-			queuedFrames = nil
-			Expect(g.SetMaxActiveConnIDs(6)).To(Succeed())
-			Expect(queuedFrames).To(HaveLen(3))
-		})
-
-		It("issues more connection IDs if the server allows a higher limit on the resumed connection, when connection IDs were retired in between", func() {
-			Expect(g.SetMaxActiveConnIDs(3)).To(Succeed())
-			Expect(queuedFrames).To(HaveLen(2))
-			queuedFrames = nil
-			g.Retire(1, protocol.ConnectionID{})
-			Expect(queuedFrames).To(HaveLen(1))
-			queuedFrames = nil
-			Expect(g.SetMaxActiveConnIDs(6)).To(Succeed())
-			Expect(queuedFrames).To(HaveLen(3))
-		})
+	t.Run("without initial client destination connection ID", func(t *testing.T) {
+		testConnIDGeneratorRemoveAll(t, false)
 	})
+}
 
-	It("errors if the peers tries to retire a connection ID that wasn't yet issued", func() {
-		Expect(g.Retire(1, protocol.ConnectionID{})).To(MatchError(&qerr.TransportError{
-			ErrorCode:    qerr.ProtocolViolation,
-			ErrorMessage: "retired connection ID 1 (highest issued: 0)",
-		}))
-	})
+func testConnIDGeneratorRemoveAll(t *testing.T, hasInitialClientDestConnID bool) {
+	var initialClientDestConnID protocol.ConnectionID
+	if hasInitialClientDestConnID {
+		initialClientDestConnID = protocol.ParseConnectionID([]byte{2, 2, 2, 2})
+	}
+	var tracker connIDTracker
+	g := newConnIDGenerator(
+		&tracker,
+		protocol.ParseConnectionID([]byte{1, 1, 1, 1}),
+		initialClientDestConnID,
+		newStatelessResetter(&StatelessResetKey{1, 2, 3, 4}),
+		&pathReceiver{},
+		func(f wire.Frame) {},
+		&protocol.DefaultConnectionIDGenerator{ConnLen: 5},
+	)
 
-	It("errors if the peers tries to retire a connection ID in a packet with that connection ID", func() {
-		Expect(g.SetMaxActiveConnIDs(4)).To(Succeed())
-		Expect(queuedFrames).ToNot(BeEmpty())
-		Expect(queuedFrames[0]).To(BeAssignableToTypeOf(&wire.NewConnectionIDFrame{}))
-		f := queuedFrames[0].(*wire.NewConnectionIDFrame)
-		Expect(g.Retire(f.SequenceNumber, f.ConnectionID)).To(MatchError(&qerr.TransportError{
-			ErrorCode:    qerr.ProtocolViolation,
-			ErrorMessage: fmt.Sprintf("retired connection ID %d (%s), which was used as the Destination Connection ID on this packet", f.SequenceNumber, f.ConnectionID),
-		}))
-	})
+	require.NoError(t, g.SetMaxActiveConnIDs(1000))
+	require.Len(t, tracker.added, protocol.MaxIssuedConnectionIDs-1)
 
-	It("issues new connection IDs, when old ones are retired", func() {
-		Expect(g.SetMaxActiveConnIDs(5)).To(Succeed())
-		queuedFrames = nil
-		Expect(retiredConnIDs).To(BeEmpty())
-		Expect(g.Retire(3, protocol.ConnectionID{})).To(Succeed())
-		Expect(queuedFrames).To(HaveLen(1))
-		Expect(queuedFrames[0]).To(BeAssignableToTypeOf(&wire.NewConnectionIDFrame{}))
-		nf := queuedFrames[0].(*wire.NewConnectionIDFrame)
-		Expect(nf.SequenceNumber).To(BeEquivalentTo(5))
-		Expect(nf.ConnectionID.Len()).To(Equal(7))
-	})
+	g.RemoveAll()
+	if hasInitialClientDestConnID {
+		require.Len(t, tracker.removed, protocol.MaxIssuedConnectionIDs+1)
+		require.Contains(t, tracker.removed, initialClientDestConnID)
+	} else {
+		require.Len(t, tracker.removed, protocol.MaxIssuedConnectionIDs)
+	}
+	for _, id := range tracker.added {
+		require.Contains(t, tracker.removed, id)
+	}
+	require.Contains(t, tracker.removed, protocol.ParseConnectionID([]byte{1, 1, 1, 1}))
+}
 
-	It("retires the initial connection ID", func() {
-		Expect(g.Retire(0, protocol.ConnectionID{})).To(Succeed())
-		Expect(removedConnIDs).To(BeEmpty())
-		Expect(retiredConnIDs).To(HaveLen(1))
-		Expect(retiredConnIDs[0]).To(Equal(initialConnID))
-		Expect(addedConnIDs).To(BeEmpty())
+func TestConnIDGeneratorReplaceWithClosed(t *testing.T) {
+	t.Run("with initial client destination connection ID", func(t *testing.T) {
+		testConnIDGeneratorReplaceWithClosed(t, true)
 	})
+	t.Run("without initial client destination connection ID", func(t *testing.T) {
+		testConnIDGeneratorReplaceWithClosed(t, false)
+	})
+}
 
-	It("handles duplicate retirements", func() {
-		Expect(g.SetMaxActiveConnIDs(11)).To(Succeed())
-		queuedFrames = nil
-		Expect(retiredConnIDs).To(BeEmpty())
-		Expect(g.Retire(5, protocol.ConnectionID{})).To(Succeed())
-		Expect(retiredConnIDs).To(HaveLen(1))
-		Expect(queuedFrames).To(HaveLen(1))
-		Expect(g.Retire(5, protocol.ConnectionID{})).To(Succeed())
-		Expect(retiredConnIDs).To(HaveLen(1))
-		Expect(queuedFrames).To(HaveLen(1))
-	})
+func testConnIDGeneratorReplaceWithClosed(t *testing.T, hasInitialClientDestConnID bool) {
+	var initialClientDestConnID protocol.ConnectionID
+	if hasInitialClientDestConnID {
+		initialClientDestConnID = protocol.ParseConnectionID([]byte{2, 2, 2, 2})
+	}
+	var tracker connIDTracker
+	g := newConnIDGenerator(
+		&tracker,
+		protocol.ParseConnectionID([]byte{1, 1, 1, 1}),
+		initialClientDestConnID,
+		newStatelessResetter(&StatelessResetKey{1, 2, 3, 4}),
+		&pathReceiver{},
+		func(f wire.Frame) {},
+		&protocol.DefaultConnectionIDGenerator{ConnLen: 5},
+	)
 
-	It("retires the client's initial destination connection ID when the handshake completes", func() {
-		g.SetHandshakeComplete()
-		Expect(retiredConnIDs).To(HaveLen(1))
-		Expect(retiredConnIDs[0]).To(Equal(initialClientDestConnID))
-	})
+	require.NoError(t, g.SetMaxActiveConnIDs(1000))
+	require.Len(t, tracker.added, protocol.MaxIssuedConnectionIDs-1)
+	// Retire two of these connection ID.
+	// This makes us issue two more connection IDs.
+	require.NoError(t, g.Retire(3, protocol.ParseConnectionID([]byte{1, 1, 1, 1}), monotime.Now()))
+	require.NoError(t, g.Retire(4, protocol.ParseConnectionID([]byte{1, 1, 1, 1}), monotime.Now()))
+	require.Len(t, tracker.added, protocol.MaxIssuedConnectionIDs+1)
 
-	It("removes all connection IDs", func() {
-		Expect(g.SetMaxActiveConnIDs(5)).To(Succeed())
-		Expect(queuedFrames).To(HaveLen(4))
-		g.RemoveAll()
-		Expect(removedConnIDs).To(HaveLen(6)) // initial conn ID, initial client dest conn id, and newly issued ones
-		Expect(removedConnIDs).To(ContainElement(initialConnID))
-		Expect(removedConnIDs).To(ContainElement(initialClientDestConnID))
-		for _, f := range queuedFrames {
-			nf := f.(*wire.NewConnectionIDFrame)
-			Expect(removedConnIDs).To(ContainElement(nf.ConnectionID))
-		}
-	})
+	g.ReplaceWithClosed([]byte("foobar"), time.Second)
+	expected := append([]protocol.ConnectionID{protocol.ParseConnectionID([]byte{1, 1, 1, 1})}, tracker.added...)
+	if hasInitialClientDestConnID {
+		expected = append(expected, initialClientDestConnID)
+	}
+	require.ElementsMatch(t, expected, tracker.replaced)
+	require.Equal(t, []byte("foobar"), tracker.replacedWith)
+	require.Empty(t, tracker.removed)
+}
 
-	It("replaces with a closed session for all connection IDs", func() {
-		Expect(g.SetMaxActiveConnIDs(5)).To(Succeed())
-		Expect(queuedFrames).To(HaveLen(4))
-		sess := NewMockPacketHandler(mockCtrl)
-		g.ReplaceWithClosed(sess)
-		Expect(replacedWithClosed).To(HaveLen(6)) // initial conn ID, initial client dest conn id, and newly issued ones
-		Expect(replacedWithClosed).To(HaveKeyWithValue(string(initialClientDestConnID), sess))
-		Expect(replacedWithClosed).To(HaveKeyWithValue(string(initialConnID), sess))
-		for _, f := range queuedFrames {
-			nf := f.(*wire.NewConnectionIDFrame)
-			Expect(replacedWithClosed).To(HaveKeyWithValue(string(nf.ConnectionID), sess))
-		}
-	})
-})
+func TestConnIDGeneratorAddConnRunner(t *testing.T) {
+	initialConnID := protocol.ParseConnectionID([]byte{1, 1, 1, 1})
+	clientDestConnID := protocol.ParseConnectionID([]byte{2, 2, 2, 2})
+
+	sr := newStatelessResetter(&StatelessResetKey{1, 2, 3, 4})
+	var queuedFrames []wire.Frame
+
+	var tracker1, tracker2 connIDTracker
+	h1 := &pathReceiver{}
+	g := newConnIDGenerator(
+		&tracker1,
+		initialConnID,
+		clientDestConnID,
+		sr,
+		h1,
+		func(f wire.Frame) { queuedFrames = append(queuedFrames, f) },
+		&protocol.DefaultConnectionIDGenerator{ConnLen: 5},
+	)
+	require.NoError(t, g.SetMaxActiveConnIDs(3))
+	require.Len(t, tracker1.added, 2)
+	h, ok := g.Handler(&tracker1)
+	require.True(t, ok)
+	require.Same(t, h1, h)
+
+	// add the second runner - it should get all existing connection IDs
+	h2 := &pathReceiver{}
+	_, ok = g.Handler(&tracker2)
+	require.False(t, ok)
+	require.True(t, g.AddConnRunner(&tracker2, h2))
+	h, ok = g.Handler(&tracker2)
+	require.True(t, ok)
+	require.Same(t, h2, h)
+	require.Len(t, tracker1.added, 2) // unchanged
+	require.ElementsMatch(t,
+		[]protocol.ConnectionID{initialConnID, clientDestConnID, tracker1.added[0], tracker1.added[1]},
+		tracker2.added,
+	)
+	for _, h := range tracker2.handlers {
+		require.Same(t, h2, h)
+	}
+
+	// adding the same transport again doesn't do anything
+	require.False(t, g.AddConnRunner(&tracker1, &pathReceiver{}))
+	require.Len(t, tracker1.added, 2)
+	h, ok = g.Handler(&tracker1)
+	require.True(t, ok)
+	require.Same(t, h1, h)
+
+	// new connection IDs are added to both runners, with their respective handlers
+	tracker1.added, tracker1.handlers = nil, nil
+	tracker2.added, tracker2.handlers = nil, nil
+	ncid := queuedFrames[0].(*wire.NewConnectionIDFrame)
+	require.NoError(t, g.Retire(ncid.SequenceNumber, protocol.ParseConnectionID([]byte{3, 3, 3, 3}), monotime.Now()))
+	require.Len(t, tracker1.added, 1)
+	require.Equal(t, tracker1.added, tracker2.added)
+	require.Len(t, tracker1.handlers, 1)
+	require.Same(t, h1, tracker1.handlers[0])
+	require.Len(t, tracker2.handlers, 1)
+	require.Same(t, h2, tracker2.handlers[0])
+
+	g.RemoveRetiredConnIDs(monotime.Now())
+	require.Equal(t, []protocol.ConnectionID{ncid.ConnectionID}, tracker1.removed)
+	require.Equal(t, []protocol.ConnectionID{ncid.ConnectionID}, tracker2.removed)
+
+	tracker1.removed = nil
+	tracker2.removed = nil
+	g.SetHandshakeComplete(monotime.Now())
+	g.RemoveRetiredConnIDs(monotime.Now())
+	require.Equal(t, []protocol.ConnectionID{clientDestConnID}, tracker1.removed)
+	require.Equal(t, []protocol.ConnectionID{clientDestConnID}, tracker2.removed)
+
+	g.ReplaceWithClosed([]byte("connection closed"), time.Second)
+	require.NotEmpty(t, tracker1.replaced)
+	require.Equal(t, tracker1.replaced, tracker2.replaced)
+
+	tracker1.removed = nil
+	tracker2.removed = nil
+	g.RemoveAll()
+	require.NotEmpty(t, tracker1.removed)
+	require.Equal(t, tracker1.removed, tracker2.removed)
+}

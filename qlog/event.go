@@ -1,529 +1,1047 @@
 package qlog
 
 import (
-	"errors"
+	"encoding/hex"
 	"fmt"
-	"net"
+	"net/netip"
 	"time"
+	"unicode/utf8"
 
-	"github.com/lucas-clemente/quic-go"
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/internal/utils"
-	"github.com/lucas-clemente/quic-go/logging"
-
-	"github.com/francoispqt/gojay"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/qlogwriter"
+	"github.com/quic-go/quic-go/qlogwriter/jsontext"
 )
 
 func milliseconds(dur time.Duration) float64 { return float64(dur.Nanoseconds()) / 1e6 }
 
-type eventDetails interface {
-	Category() category
-	Name() string
-	gojay.MarshalerJSONObject
+type encoderHelper struct {
+	enc *jsontext.Encoder
+	err error
 }
 
-type event struct {
-	RelativeTime time.Duration
-	eventDetails
+func (h *encoderHelper) WriteToken(t jsontext.Token) {
+	if h.err != nil {
+		return
+	}
+	h.err = h.enc.WriteToken(t)
 }
 
-var _ gojay.MarshalerJSONObject = event{}
-
-func (e event) IsNil() bool { return false }
-func (e event) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.Float64Key("time", milliseconds(e.RelativeTime))
-	enc.StringKey("name", e.Category().String()+":"+e.Name())
-	enc.ObjectKey("data", e.eventDetails)
+func (h *encoderHelper) WriteIPAddressPort(addr netip.AddrPort) {
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("ip"))
+	h.WriteToken(jsontext.String(addr.Addr().String()))
+	h.WriteToken(jsontext.String("port"))
+	h.WriteToken(jsontext.Uint(uint64(addr.Port())))
+	h.WriteToken(jsontext.EndObject)
 }
 
-type versions []versionNumber
+type versions []Version
 
-func (v versions) IsNil() bool { return false }
-func (v versions) MarshalJSONArray(enc *gojay.Encoder) {
+func (v versions) encode(enc *jsontext.Encoder) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginArray)
 	for _, e := range v {
-		enc.AddString(e.String())
+		h.WriteToken(jsontext.String(fmt.Sprintf("%x", uint32(e))))
 	}
+	h.WriteToken(jsontext.EndArray)
+	return h.err
 }
 
-type rawInfo struct {
-	Length        logging.ByteCount // full packet length, including header and AEAD authentication tag
-	PayloadLength logging.ByteCount // length of the packet payload, excluding AEAD tag
+// OmitLength indicates that a length should not be logged.
+const OmitLength = -1
+
+// RawInfo contains packet or datagram lengths. Zero lengths are logged.
+// Set a field to OmitLength to omit it.
+type RawInfo struct {
+	Length        int // full packet length, including header and AEAD authentication tag
+	PayloadLength int // length of the packet payload, excluding AEAD tag
 }
 
-func (i rawInfo) IsNil() bool { return false }
-func (i rawInfo) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.Uint64Key("length", uint64(i.Length))
-	enc.Uint64KeyOmitEmpty("payload_length", uint64(i.PayloadLength))
+func (i RawInfo) encode(enc *jsontext.Encoder) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	if i.Length != OmitLength {
+		h.WriteToken(jsontext.String("length"))
+		h.WriteToken(jsontext.Uint(uint64(i.Length)))
+	}
+	if i.PayloadLength != OmitLength {
+		h.WriteToken(jsontext.String("payload_length"))
+		h.WriteToken(jsontext.Uint(uint64(i.PayloadLength)))
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
 }
 
-type eventConnectionStarted struct {
-	SrcAddr  *net.UDPAddr
-	DestAddr *net.UDPAddr
-
-	SrcConnectionID  protocol.ConnectionID
-	DestConnectionID protocol.ConnectionID
+type TupleEndpointInfo struct {
+	IPv4 netip.AddrPort
+	IPv6 netip.AddrPort
 }
 
-var _ eventDetails = &eventConnectionStarted{}
+func (p TupleEndpointInfo) encode(enc *jsontext.Encoder, redacted *string) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	if redacted != nil {
+		if p.IPv4.IsValid() {
+			h.WriteToken(jsontext.String("address_v4"))
+		} else {
+			h.WriteToken(jsontext.String("address_v6"))
+		}
+		h.WriteToken(jsontext.String(*redacted))
+		h.WriteToken(jsontext.EndObject)
+		return h.err
+	}
+	if p.IPv4.IsValid() {
+		h.WriteToken(jsontext.String("address_v4"))
+		h.WriteIPAddressPort(p.IPv4)
+	}
+	if p.IPv6.IsValid() {
+		h.WriteToken(jsontext.String("address_v6"))
+		h.WriteIPAddressPort(p.IPv6)
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
 
-func (e eventConnectionStarted) Category() category { return categoryTransport }
-func (e eventConnectionStarted) Name() string       { return "connection_started" }
-func (e eventConnectionStarted) IsNil() bool        { return false }
+type StartedConnection struct {
+	Local  TupleEndpointInfo
+	Remote TupleEndpointInfo
 
-func (e eventConnectionStarted) MarshalJSONObject(enc *gojay.Encoder) {
-	if utils.IsIPv4(e.SrcAddr.IP) {
-		enc.StringKey("ip_version", "ipv4")
+	// Non-nil redacted values replace the corresponding IP and port in qlog output.
+	RedactedLocal, RedactedRemote *string
+}
+
+func (e StartedConnection) Name() string { return "transport:connection_started" }
+
+func (e StartedConnection) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("local"))
+	if err := e.Local.encode(enc, e.RedactedLocal); err != nil {
+		return err
+	}
+	h.WriteToken(jsontext.String("remote"))
+	if err := e.Remote.encode(enc, e.RedactedRemote); err != nil {
+		return err
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// TupleAssigned associates a TupleID with the endpoints of a network tuple.
+type TupleAssigned struct {
+	TupleID string
+	Local   TupleEndpointInfo
+	Remote  TupleEndpointInfo
+
+	// non-nil redacted values replace the corresponding IP and port in qlog output
+	RedactedLocal, RedactedRemote *string
+}
+
+func (e TupleAssigned) Name() string { return "transport:tuple_assigned" }
+
+func (e TupleAssigned) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("tuple_id"))
+	h.WriteToken(jsontext.String(e.TupleID))
+	h.WriteToken(jsontext.String("tuple_local"))
+	if err := e.Local.encode(enc, e.RedactedLocal); err != nil {
+		return err
+	}
+	h.WriteToken(jsontext.String("tuple_remote"))
+	if err := e.Remote.encode(enc, e.RedactedRemote); err != nil {
+		return err
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+type VersionInformation struct {
+	ClientVersions, ServerVersions []Version
+	ChosenVersion                  Version
+}
+
+func (e VersionInformation) Name() string { return "transport:version_information" }
+
+func (e VersionInformation) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	if len(e.ClientVersions) > 0 {
+		h.WriteToken(jsontext.String("client_versions"))
+		if err := versions(e.ClientVersions).encode(enc); err != nil {
+			return err
+		}
+	}
+	if len(e.ServerVersions) > 0 {
+		h.WriteToken(jsontext.String("server_versions"))
+		if err := versions(e.ServerVersions).encode(enc); err != nil {
+			return err
+		}
+	}
+	h.WriteToken(jsontext.String("chosen_version"))
+	h.WriteToken(jsontext.String(fmt.Sprintf("%x", uint32(e.ChosenVersion))))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+type ConnectionClosed struct {
+	Initiator Initiator
+
+	ConnectionError  *TransportErrorCode
+	ApplicationError *ApplicationErrorCode
+
+	Reason string
+
+	Trigger ConnectionCloseTrigger
+}
+
+func (e ConnectionClosed) Name() string { return "transport:connection_closed" }
+
+func (e ConnectionClosed) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("initiator"))
+	h.WriteToken(jsontext.String(string(e.Initiator)))
+	if e.ConnectionError != nil {
+		h.WriteToken(jsontext.String("connection_error"))
+		if name := transportError(*e.ConnectionError).String(); name != "" {
+			h.WriteToken(jsontext.String(name))
+		} else {
+			h.WriteToken(jsontext.String("unknown"))
+			h.WriteToken(jsontext.String("error_code"))
+			h.WriteToken(jsontext.Uint(uint64(*e.ConnectionError)))
+		}
+	}
+	if e.ApplicationError != nil {
+		h.WriteToken(jsontext.String("application_error"))
+		h.WriteToken(jsontext.String("unknown"))
+		h.WriteToken(jsontext.String("error_code"))
+		h.WriteToken(jsontext.Uint(uint64(*e.ApplicationError)))
+	}
+	if e.ConnectionError != nil || e.ApplicationError != nil {
+		h.WriteToken(jsontext.String("reason"))
+		h.WriteToken(jsontext.String(e.Reason))
+	}
+	if e.Trigger != "" {
+		h.WriteToken(jsontext.String("trigger"))
+		h.WriteToken(jsontext.String(string(e.Trigger)))
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+type ConnectionStateUpdated struct {
+	State ConnectionState
+}
+
+func (e ConnectionStateUpdated) Name() string { return "quic:connection_state_updated" }
+
+func (e ConnectionStateUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("new"))
+	h.WriteToken(jsontext.String(string(e.State)))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+type PacketSent struct {
+	Header                  PacketHeader
+	Raw                     RawInfo
+	DatagramPayloadChecksum DatagramPayloadChecksum
+	Frames                  []Frame
+	ECN                     ECN
+	Trigger                 string
+	SupportedVersions       []Version
+	IsMTUProbePacket        bool
+	// Tuple is the TupleID of the network tuple that the packet was sent on.
+	// It is empty for the tuple that the TupleID "" is assigned to.
+	Tuple string
+}
+
+func (e PacketSent) Name() string { return "transport:packet_sent" }
+
+func (e PacketSent) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("header"))
+	if err := e.Header.encode(enc); err != nil {
+		return err
+	}
+	h.WriteToken(jsontext.String("raw"))
+	if err := e.Raw.encode(enc); err != nil {
+		return err
+	}
+	if e.DatagramPayloadChecksum != 0 {
+		h.WriteToken(jsontext.String("datagram_payload_checksum"))
+		h.WriteToken(jsontext.Uint(uint64(e.DatagramPayloadChecksum)))
+	}
+	if len(e.Frames) > 0 {
+		h.WriteToken(jsontext.String("frames"))
+		if err := frames(e.Frames).encode(enc); err != nil {
+			return err
+		}
+	}
+	if e.ECN != ECNUnsupported {
+		h.WriteToken(jsontext.String("ecn"))
+		h.WriteToken(jsontext.String(string(e.ECN)))
+	}
+	if e.Trigger != "" {
+		h.WriteToken(jsontext.String("trigger"))
+		h.WriteToken(jsontext.String(e.Trigger))
+	}
+	if e.IsMTUProbePacket {
+		h.WriteToken(jsontext.String("is_mtu_probe_packet"))
+		h.WriteToken(jsontext.True)
+	}
+	if e.Tuple != "" {
+		h.WriteToken(jsontext.String("tuple"))
+		h.WriteToken(jsontext.String(e.Tuple))
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+type PacketReceived struct {
+	Header                  PacketHeader
+	Raw                     RawInfo
+	DatagramPayloadChecksum DatagramPayloadChecksum
+	Frames                  []Frame
+	ECN                     ECN
+	Trigger                 string
+	// Tuple is the TupleID of the network tuple that the packet was received on.
+	// It is empty for the tuple that the TupleID "" is assigned to.
+	Tuple string
+}
+
+func (e PacketReceived) Name() string { return "transport:packet_received" }
+
+func (e PacketReceived) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("header"))
+	if err := e.Header.encode(enc); err != nil {
+		return err
+	}
+	h.WriteToken(jsontext.String("raw"))
+	if err := e.Raw.encode(enc); err != nil {
+		return err
+	}
+	if e.DatagramPayloadChecksum != 0 {
+		h.WriteToken(jsontext.String("datagram_payload_checksum"))
+		h.WriteToken(jsontext.Uint(uint64(e.DatagramPayloadChecksum)))
+	}
+	if len(e.Frames) > 0 {
+		h.WriteToken(jsontext.String("frames"))
+		if err := frames(e.Frames).encode(enc); err != nil {
+			return err
+		}
+	}
+	if e.ECN != ECNUnsupported {
+		h.WriteToken(jsontext.String("ecn"))
+		h.WriteToken(jsontext.String(string(e.ECN)))
+	}
+	if e.Trigger != "" {
+		h.WriteToken(jsontext.String("trigger"))
+		h.WriteToken(jsontext.String(e.Trigger))
+	}
+	if e.Tuple != "" {
+		h.WriteToken(jsontext.String("tuple"))
+		h.WriteToken(jsontext.String(e.Tuple))
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+type VersionNegotiationReceived struct {
+	Header            PacketHeaderVersionNegotiation
+	SupportedVersions []Version
+}
+
+func (e VersionNegotiationReceived) Name() string { return "transport:packet_received" }
+
+func (e VersionNegotiationReceived) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("header"))
+	if err := e.Header.encode(enc); err != nil {
+		return err
+	}
+	h.WriteToken(jsontext.String("supported_versions"))
+	if err := versions(e.SupportedVersions).encode(enc); err != nil {
+		return err
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+type VersionNegotiationSent struct {
+	Header            PacketHeaderVersionNegotiation
+	SupportedVersions []Version
+}
+
+func (e VersionNegotiationSent) Name() string { return "transport:packet_sent" }
+
+func (e VersionNegotiationSent) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("header"))
+	if err := e.Header.encode(enc); err != nil {
+		return err
+	}
+	h.WriteToken(jsontext.String("supported_versions"))
+	if err := versions(e.SupportedVersions).encode(enc); err != nil {
+		return err
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+type PacketBuffered struct {
+	Header                  PacketHeader
+	Raw                     RawInfo
+	DatagramPayloadChecksum DatagramPayloadChecksum
+}
+
+func (e PacketBuffered) Name() string { return "transport:packet_buffered" }
+
+func (e PacketBuffered) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("header"))
+	if err := e.Header.encode(enc); err != nil {
+		return err
+	}
+	h.WriteToken(jsontext.String("raw"))
+	if err := e.Raw.encode(enc); err != nil {
+		return err
+	}
+	if e.DatagramPayloadChecksum != 0 {
+		h.WriteToken(jsontext.String("datagram_payload_checksum"))
+		h.WriteToken(jsontext.Uint(uint64(e.DatagramPayloadChecksum)))
+	}
+	h.WriteToken(jsontext.String("trigger"))
+	h.WriteToken(jsontext.String("keys_unavailable"))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// PacketDropped is the transport:packet_dropped event.
+type PacketDropped struct {
+	Header                  PacketHeader
+	Raw                     RawInfo
+	DatagramPayloadChecksum DatagramPayloadChecksum
+	Trigger                 PacketDropReason
+}
+
+func (e PacketDropped) Name() string { return "transport:packet_dropped" }
+
+func (e PacketDropped) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("header"))
+	if err := e.Header.encode(enc); err != nil {
+		return err
+	}
+	h.WriteToken(jsontext.String("raw"))
+	if err := e.Raw.encode(enc); err != nil {
+		return err
+	}
+	if e.DatagramPayloadChecksum != 0 {
+		h.WriteToken(jsontext.String("datagram_payload_checksum"))
+		h.WriteToken(jsontext.Uint(uint64(e.DatagramPayloadChecksum)))
+	}
+	trigger := e.Trigger.trigger()
+	h.WriteToken(jsontext.String("trigger"))
+	h.WriteToken(jsontext.String(trigger))
+	// preserve the more specific reason
+	if trigger != string(e.Trigger) {
+		h.WriteToken(jsontext.String("details"))
+		h.WriteToken(jsontext.BeginObject)
+		h.WriteToken(jsontext.String("reason"))
+		h.WriteToken(jsontext.String(string(e.Trigger)))
+		h.WriteToken(jsontext.EndObject)
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// DatagramDropped is the quic:datagram_dropped event.
+type DatagramDropped struct {
+	Direction Direction
+	Raw       RawInfo
+	Trigger   string
+}
+
+var _ qlogwriter.Event = DatagramDropped{}
+
+func (e DatagramDropped) Name() string { return "quic:datagram_dropped" }
+
+func (e DatagramDropped) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	if e.Direction != "" {
+		h.WriteToken(jsontext.String("direction"))
+		h.WriteToken(jsontext.String(string(e.Direction)))
+	}
+	h.WriteToken(jsontext.String("raw"))
+	if err := e.Raw.encode(enc); err != nil {
+		return err
+	}
+	if e.Trigger != "" {
+		h.WriteToken(jsontext.String("trigger"))
+		h.WriteToken(jsontext.String(e.Trigger))
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// StreamPriorityUpdated closely follows the http3:priority_updated event from
+// draft-ietf-quic-qlog-h3-events.
+type StreamPriorityUpdated struct {
+	StreamID    StreamID
+	Urgency     int8
+	Incremental bool
+}
+
+func (e StreamPriorityUpdated) Name() string { return "transport:priority_updated" }
+
+func (e StreamPriorityUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("stream_id"))
+	h.WriteToken(jsontext.Int(int64(e.StreamID)))
+	h.WriteToken(jsontext.String("new"))
+	newPriority := fmt.Sprintf("u=%d", e.Urgency)
+	if e.Incremental {
+		newPriority += ", i"
+	}
+	h.WriteToken(jsontext.String(newPriority))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+type MTUUpdated struct {
+	Value int
+	Done  bool
+}
+
+func (e MTUUpdated) Name() string { return "recovery:mtu_updated" }
+
+func (e MTUUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("new"))
+	h.WriteToken(jsontext.Uint(uint64(e.Value)))
+	h.WriteToken(jsontext.String("done"))
+	h.WriteToken(jsontext.Bool(e.Done))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// RecoveryParametersSet is the quic:recovery_parameters_set event.
+type RecoveryParametersSet struct {
+	ReorderingThreshold     uint16
+	PacketThresholdDisabled bool
+	TimeThreshold           float64 // RTT multiplier.
+	TimerGranularity        time.Duration
+	InitialCongestionWindow protocol.ByteCount
+	InitialRTT              time.Duration
+}
+
+var _ qlogwriter.Event = RecoveryParametersSet{}
+
+func (e RecoveryParametersSet) Name() string { return "quic:recovery_parameters_set" }
+
+func (e RecoveryParametersSet) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("reordering_threshold"))
+	if e.PacketThresholdDisabled {
+		h.WriteToken(jsontext.String("disabled"))
 	} else {
-		enc.StringKey("ip_version", "ipv6")
+		h.WriteToken(jsontext.Uint(uint64(e.ReorderingThreshold)))
 	}
-	enc.StringKey("src_ip", e.SrcAddr.IP.String())
-	enc.IntKey("src_port", e.SrcAddr.Port)
-	enc.StringKey("dst_ip", e.DestAddr.IP.String())
-	enc.IntKey("dst_port", e.DestAddr.Port)
-	enc.StringKey("src_cid", connectionID(e.SrcConnectionID).String())
-	enc.StringKey("dst_cid", connectionID(e.DestConnectionID).String())
-}
-
-type eventVersionNegotiated struct {
-	clientVersions, serverVersions []versionNumber
-	chosenVersion                  versionNumber
-}
-
-func (e eventVersionNegotiated) Category() category { return categoryTransport }
-func (e eventVersionNegotiated) Name() string       { return "version_information" }
-func (e eventVersionNegotiated) IsNil() bool        { return false }
-
-func (e eventVersionNegotiated) MarshalJSONObject(enc *gojay.Encoder) {
-	if len(e.clientVersions) > 0 {
-		enc.ArrayKey("client_versions", versions(e.clientVersions))
+	h.WriteToken(jsontext.String("time_threshold"))
+	h.WriteToken(jsontext.Float(e.TimeThreshold))
+	h.WriteToken(jsontext.String("timer_granularity"))
+	h.WriteToken(jsontext.Uint(uint64(e.TimerGranularity / time.Millisecond)))
+	if e.InitialCongestionWindow != 0 {
+		h.WriteToken(jsontext.String("initial_congestion_window"))
+		h.WriteToken(jsontext.Uint(uint64(e.InitialCongestionWindow)))
 	}
-	if len(e.serverVersions) > 0 {
-		enc.ArrayKey("server_versions", versions(e.serverVersions))
+	if e.InitialRTT != 0 {
+		h.WriteToken(jsontext.String("initial_rtt"))
+		h.WriteToken(jsontext.Float(milliseconds(e.InitialRTT)))
 	}
-	enc.StringKey("chosen_version", e.chosenVersion.String())
+	h.WriteToken(jsontext.EndObject)
+	return h.err
 }
 
-type eventConnectionClosed struct {
-	e error
-}
-
-func (e eventConnectionClosed) Category() category { return categoryTransport }
-func (e eventConnectionClosed) Name() string       { return "connection_closed" }
-func (e eventConnectionClosed) IsNil() bool        { return false }
-
-func (e eventConnectionClosed) MarshalJSONObject(enc *gojay.Encoder) {
-	var (
-		statelessResetErr     *quic.StatelessResetError
-		handshakeTimeoutErr   *quic.HandshakeTimeoutError
-		idleTimeoutErr        *quic.IdleTimeoutError
-		applicationErr        *quic.ApplicationError
-		transportErr          *quic.TransportError
-		versionNegotiationErr *quic.VersionNegotiationError
-	)
-	switch {
-	case errors.As(e.e, &statelessResetErr):
-		enc.StringKey("owner", ownerRemote.String())
-		enc.StringKey("trigger", "stateless_reset")
-		enc.StringKey("stateless_reset_token", fmt.Sprintf("%x", statelessResetErr.Token))
-	case errors.As(e.e, &handshakeTimeoutErr):
-		enc.StringKey("owner", ownerLocal.String())
-		enc.StringKey("trigger", "handshake_timeout")
-	case errors.As(e.e, &idleTimeoutErr):
-		enc.StringKey("owner", ownerLocal.String())
-		enc.StringKey("trigger", "idle_timeout")
-	case errors.As(e.e, &applicationErr):
-		owner := ownerLocal
-		if applicationErr.Remote {
-			owner = ownerRemote
-		}
-		enc.StringKey("owner", owner.String())
-		enc.Uint64Key("application_code", uint64(applicationErr.ErrorCode))
-		enc.StringKey("reason", applicationErr.ErrorMessage)
-	case errors.As(e.e, &transportErr):
-		owner := ownerLocal
-		if transportErr.Remote {
-			owner = ownerRemote
-		}
-		enc.StringKey("owner", owner.String())
-		enc.StringKey("connection_code", transportError(transportErr.ErrorCode).String())
-		enc.StringKey("reason", transportErr.ErrorMessage)
-	case errors.As(e.e, &versionNegotiationErr):
-		enc.StringKey("owner", ownerRemote.String())
-		enc.StringKey("trigger", "version_negotiation")
-	}
-}
-
-type eventPacketSent struct {
-	Header        packetHeader
-	Length        logging.ByteCount
-	PayloadLength logging.ByteCount
-	Frames        frames
-	IsCoalesced   bool
-	Trigger       string
-}
-
-var _ eventDetails = eventPacketSent{}
-
-func (e eventPacketSent) Category() category { return categoryTransport }
-func (e eventPacketSent) Name() string       { return "packet_sent" }
-func (e eventPacketSent) IsNil() bool        { return false }
-
-func (e eventPacketSent) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.ObjectKey("header", e.Header)
-	enc.ObjectKey("raw", rawInfo{Length: e.Length, PayloadLength: e.PayloadLength})
-	enc.ArrayKeyOmitEmpty("frames", e.Frames)
-	enc.BoolKeyOmitEmpty("is_coalesced", e.IsCoalesced)
-	enc.StringKeyOmitEmpty("trigger", e.Trigger)
-}
-
-type eventPacketReceived struct {
-	Header        packetHeader
-	Length        logging.ByteCount
-	PayloadLength logging.ByteCount
-	Frames        frames
-	IsCoalesced   bool
-	Trigger       string
-}
-
-var _ eventDetails = eventPacketReceived{}
-
-func (e eventPacketReceived) Category() category { return categoryTransport }
-func (e eventPacketReceived) Name() string       { return "packet_received" }
-func (e eventPacketReceived) IsNil() bool        { return false }
-
-func (e eventPacketReceived) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.ObjectKey("header", e.Header)
-	enc.ObjectKey("raw", rawInfo{Length: e.Length, PayloadLength: e.PayloadLength})
-	enc.ArrayKeyOmitEmpty("frames", e.Frames)
-	enc.BoolKeyOmitEmpty("is_coalesced", e.IsCoalesced)
-	enc.StringKeyOmitEmpty("trigger", e.Trigger)
-}
-
-type eventRetryReceived struct {
-	Header packetHeader
-}
-
-func (e eventRetryReceived) Category() category { return categoryTransport }
-func (e eventRetryReceived) Name() string       { return "packet_received" }
-func (e eventRetryReceived) IsNil() bool        { return false }
-
-func (e eventRetryReceived) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.ObjectKey("header", e.Header)
-}
-
-type eventVersionNegotiationReceived struct {
-	Header            packetHeader
-	SupportedVersions []versionNumber
-}
-
-func (e eventVersionNegotiationReceived) Category() category { return categoryTransport }
-func (e eventVersionNegotiationReceived) Name() string       { return "packet_received" }
-func (e eventVersionNegotiationReceived) IsNil() bool        { return false }
-
-func (e eventVersionNegotiationReceived) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.ObjectKey("header", e.Header)
-	enc.ArrayKey("supported_versions", versions(e.SupportedVersions))
-}
-
-type eventPacketBuffered struct {
-	PacketType logging.PacketType
-}
-
-func (e eventPacketBuffered) Category() category { return categoryTransport }
-func (e eventPacketBuffered) Name() string       { return "packet_buffered" }
-func (e eventPacketBuffered) IsNil() bool        { return false }
-
-func (e eventPacketBuffered) MarshalJSONObject(enc *gojay.Encoder) {
-	//nolint:gosimple
-	enc.ObjectKey("header", packetHeaderWithType{PacketType: e.PacketType})
-	enc.StringKey("trigger", "keys_unavailable")
-}
-
-type eventPacketDropped struct {
-	PacketType logging.PacketType
-	PacketSize protocol.ByteCount
-	Trigger    packetDropReason
-}
-
-func (e eventPacketDropped) Category() category { return categoryTransport }
-func (e eventPacketDropped) Name() string       { return "packet_dropped" }
-func (e eventPacketDropped) IsNil() bool        { return false }
-
-func (e eventPacketDropped) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.ObjectKey("header", packetHeaderWithType{PacketType: e.PacketType})
-	enc.ObjectKey("raw", rawInfo{Length: e.PacketSize})
-	enc.StringKey("trigger", e.Trigger.String())
-}
-
-type metrics struct {
-	MinRTT      time.Duration
-	SmoothedRTT time.Duration
-	LatestRTT   time.Duration
-	RTTVariance time.Duration
-
-	CongestionWindow protocol.ByteCount
-	BytesInFlight    protocol.ByteCount
+// MetricsUpdated logs a snapshot of RTT and congestion metrics as defined in the
+// recovery:metrics_updated event.
+// The PTO count is logged via [PTOCountUpdated].
+type MetricsUpdated struct {
+	MinRTT           time.Duration
+	SmoothedRTT      time.Duration
+	LatestRTT        time.Duration
+	RTTVariance      time.Duration
+	CongestionWindow int
+	BytesInFlight    int
 	PacketsInFlight  int
 }
 
-type eventMetricsUpdated struct {
-	Last    *metrics
-	Current *metrics
+func (e MetricsUpdated) Name() string { return "recovery:metrics_updated" }
+
+func (e MetricsUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	if e.MinRTT != 0 {
+		h.WriteToken(jsontext.String("min_rtt"))
+		h.WriteToken(jsontext.Float(milliseconds(e.MinRTT)))
+	}
+	if e.SmoothedRTT != 0 {
+		h.WriteToken(jsontext.String("smoothed_rtt"))
+		h.WriteToken(jsontext.Float(milliseconds(e.SmoothedRTT)))
+	}
+	if e.LatestRTT != 0 {
+		h.WriteToken(jsontext.String("latest_rtt"))
+		h.WriteToken(jsontext.Float(milliseconds(e.LatestRTT)))
+	}
+	if e.RTTVariance != 0 || e.SmoothedRTT != 0 {
+		h.WriteToken(jsontext.String("rtt_variance"))
+		h.WriteToken(jsontext.Float(milliseconds(e.RTTVariance)))
+	}
+	h.WriteToken(jsontext.String("congestion_window"))
+	h.WriteToken(jsontext.Uint(uint64(e.CongestionWindow)))
+	h.WriteToken(jsontext.String("bytes_in_flight"))
+	h.WriteToken(jsontext.Uint(uint64(e.BytesInFlight)))
+	h.WriteToken(jsontext.String("packets_in_flight"))
+	h.WriteToken(jsontext.Uint(uint64(e.PacketsInFlight)))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
 }
 
-func (e eventMetricsUpdated) Category() category { return categoryRecovery }
-func (e eventMetricsUpdated) Name() string       { return "metrics_updated" }
-func (e eventMetricsUpdated) IsNil() bool        { return false }
-
-func (e eventMetricsUpdated) MarshalJSONObject(enc *gojay.Encoder) {
-	if e.Last == nil || e.Last.MinRTT != e.Current.MinRTT {
-		enc.FloatKey("min_rtt", milliseconds(e.Current.MinRTT))
-	}
-	if e.Last == nil || e.Last.SmoothedRTT != e.Current.SmoothedRTT {
-		enc.FloatKey("smoothed_rtt", milliseconds(e.Current.SmoothedRTT))
-	}
-	if e.Last == nil || e.Last.LatestRTT != e.Current.LatestRTT {
-		enc.FloatKey("latest_rtt", milliseconds(e.Current.LatestRTT))
-	}
-	if e.Last == nil || e.Last.RTTVariance != e.Current.RTTVariance {
-		enc.FloatKey("rtt_variance", milliseconds(e.Current.RTTVariance))
-	}
-
-	if e.Last == nil || e.Last.CongestionWindow != e.Current.CongestionWindow {
-		enc.Uint64Key("congestion_window", uint64(e.Current.CongestionWindow))
-	}
-	if e.Last == nil || e.Last.BytesInFlight != e.Current.BytesInFlight {
-		enc.Uint64Key("bytes_in_flight", uint64(e.Current.BytesInFlight))
-	}
-	if e.Last == nil || e.Last.PacketsInFlight != e.Current.PacketsInFlight {
-		enc.Uint64KeyOmitEmpty("packets_in_flight", uint64(e.Current.PacketsInFlight))
-	}
+// PTOCountUpdated logs the pto_count value of the
+// recovery:metrics_updated event.
+type PTOCountUpdated struct {
+	PTOCount uint32
 }
 
-type eventUpdatedPTO struct {
-	Value uint32
+func (e PTOCountUpdated) Name() string { return "recovery:metrics_updated" }
+
+func (e PTOCountUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("pto_count"))
+	h.WriteToken(jsontext.Uint(uint64(e.PTOCount)))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
 }
 
-func (e eventUpdatedPTO) Category() category { return categoryRecovery }
-func (e eventUpdatedPTO) Name() string       { return "metrics_updated" }
-func (e eventUpdatedPTO) IsNil() bool        { return false }
-
-func (e eventUpdatedPTO) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.Uint32Key("pto_count", e.Value)
+type PacketLost struct {
+	Header           PacketHeader
+	IsMTUProbePacket bool
+	Trigger          PacketLossReason
 }
 
-type eventPacketLost struct {
-	PacketType   logging.PacketType
-	PacketNumber protocol.PacketNumber
-	Trigger      packetLossReason
+func (e PacketLost) Name() string { return "recovery:packet_lost" }
+
+func (e PacketLost) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("header"))
+	if err := e.Header.encode(enc); err != nil {
+		return err
+	}
+	if e.IsMTUProbePacket {
+		h.WriteToken(jsontext.String("is_mtu_probe_packet"))
+		h.WriteToken(jsontext.True)
+	}
+	h.WriteToken(jsontext.String("trigger"))
+	h.WriteToken(jsontext.String(string(e.Trigger)))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
 }
 
-func (e eventPacketLost) Category() category { return categoryRecovery }
-func (e eventPacketLost) Name() string       { return "packet_lost" }
-func (e eventPacketLost) IsNil() bool        { return false }
-
-func (e eventPacketLost) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.ObjectKey("header", packetHeaderWithTypeAndPacketNumber{
-		PacketType:   e.PacketType,
-		PacketNumber: e.PacketNumber,
-	})
-	enc.StringKey("trigger", e.Trigger.String())
+type SpuriousLoss struct {
+	EncryptionLevel protocol.EncryptionLevel
+	PacketNumber    protocol.PacketNumber
+	// PacketReordering is the distance to the ACK's largest acknowledged packet,
+	// adjusted for known skipped packet numbers. Reordered ACKs can yield zero.
+	PacketReordering uint64
+	TimeReordering   time.Duration
 }
 
-type eventKeyUpdated struct {
-	Trigger    keyUpdateTrigger
-	KeyType    keyType
-	Generation protocol.KeyPhase
+func (e SpuriousLoss) Name() string { return "recovery:spurious_loss" }
+
+func (e SpuriousLoss) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("packet_number_space"))
+	h.WriteToken(jsontext.String(encLevelToPacketNumberSpace(e.EncryptionLevel)))
+	h.WriteToken(jsontext.String("packet_number"))
+	h.WriteToken(jsontext.Uint(uint64(e.PacketNumber)))
+	h.WriteToken(jsontext.String("reordering_packets"))
+	h.WriteToken(jsontext.Uint(e.PacketReordering))
+	h.WriteToken(jsontext.String("reordering_time"))
+	h.WriteToken(jsontext.Float(milliseconds(e.TimeReordering)))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+type KeyUpdated struct {
+	Trigger  KeyUpdateTrigger
+	KeyType  KeyType
+	KeyPhase KeyPhase // only set for 1-RTT keys
 	// we don't log the keys here, so we don't need `old` and `new`.
 }
 
-func (e eventKeyUpdated) Category() category { return categorySecurity }
-func (e eventKeyUpdated) Name() string       { return "key_updated" }
-func (e eventKeyUpdated) IsNil() bool        { return false }
+func (e KeyUpdated) Name() string { return "security:key_updated" }
 
-func (e eventKeyUpdated) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.StringKey("trigger", e.Trigger.String())
-	enc.StringKey("key_type", e.KeyType.String())
-	if e.KeyType == keyTypeClient1RTT || e.KeyType == keyTypeServer1RTT {
-		enc.Uint64Key("generation", uint64(e.Generation))
+func (e KeyUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("trigger"))
+	h.WriteToken(jsontext.String(string(e.Trigger)))
+	h.WriteToken(jsontext.String("key_type"))
+	h.WriteToken(jsontext.String(string(e.KeyType)))
+	if e.KeyType == KeyTypeClient1RTT || e.KeyType == KeyTypeServer1RTT {
+		h.WriteToken(jsontext.String("key_phase"))
+		h.WriteToken(jsontext.Uint(uint64(e.KeyPhase)))
 	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
 }
 
-type eventKeyRetired struct {
-	KeyType    keyType
-	Generation protocol.KeyPhase
+type KeyDiscarded struct {
+	KeyType  KeyType
+	KeyPhase KeyPhase // only set for 1-RTT keys
 }
 
-func (e eventKeyRetired) Category() category { return categorySecurity }
-func (e eventKeyRetired) Name() string       { return "key_retired" }
-func (e eventKeyRetired) IsNil() bool        { return false }
+func (e KeyDiscarded) Name() string { return "security:key_discarded" }
 
-func (e eventKeyRetired) MarshalJSONObject(enc *gojay.Encoder) {
-	if e.KeyType != keyTypeClient1RTT && e.KeyType != keyTypeServer1RTT {
-		enc.StringKey("trigger", "tls")
+func (e KeyDiscarded) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	if e.KeyType != KeyTypeClient1RTT && e.KeyType != KeyTypeServer1RTT {
+		h.WriteToken(jsontext.String("trigger"))
+		h.WriteToken(jsontext.String("tls"))
 	}
-	enc.StringKey("key_type", e.KeyType.String())
-	if e.KeyType == keyTypeClient1RTT || e.KeyType == keyTypeServer1RTT {
-		enc.Uint64Key("generation", uint64(e.Generation))
+	h.WriteToken(jsontext.String("key_type"))
+	h.WriteToken(jsontext.String(string(e.KeyType)))
+	if e.KeyType == KeyTypeClient1RTT || e.KeyType == KeyTypeServer1RTT {
+		h.WriteToken(jsontext.String("key_phase"))
+		h.WriteToken(jsontext.Uint(uint64(e.KeyPhase)))
 	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
 }
 
-type eventTransportParameters struct {
-	Restore bool
-	Owner   owner
-	SentBy  protocol.Perspective
-
+type ParametersSet struct {
+	Initiator                       Initiator
+	SentBy                          protocol.Perspective
 	OriginalDestinationConnectionID protocol.ConnectionID
 	InitialSourceConnectionID       protocol.ConnectionID
-	RetrySourceConnectionID         *protocol.ConnectionID
+	RetrySourceConnectionID         protocol.ConnectionID
+	StatelessResetToken             *protocol.StatelessResetToken
+	DisableActiveMigration          bool
+	MaxIdleTimeout                  time.Duration
+	MaxUDPPayloadSize               protocol.ByteCount
+	AckDelayExponent                uint8
+	MaxAckDelay                     time.Duration
+	ActiveConnectionIDLimit         uint64
+	InitialMaxData                  protocol.ByteCount
+	InitialMaxStreamDataBidiLocal   protocol.ByteCount
+	InitialMaxStreamDataBidiRemote  protocol.ByteCount
+	InitialMaxStreamDataUni         protocol.ByteCount
+	InitialMaxStreamsBidi           int64
+	InitialMaxStreamsUni            int64
+	PreferredAddress                *PreferredAddress
+	MaxDatagramFrameSize            protocol.ByteCount
+	EnableResetStreamAt             bool
+}
 
-	StatelessResetToken     *protocol.StatelessResetToken
-	DisableActiveMigration  bool
-	MaxIdleTimeout          time.Duration
-	MaxUDPPayloadSize       protocol.ByteCount
-	AckDelayExponent        uint8
-	MaxAckDelay             time.Duration
-	ActiveConnectionIDLimit uint64
+func (e ParametersSet) Name() string { return "transport:parameters_set" }
 
+func (e ParametersSet) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("initiator"))
+	h.WriteToken(jsontext.String(string(e.Initiator)))
+	if e.SentBy == protocol.PerspectiveServer {
+		h.WriteToken(jsontext.String("original_destination_connection_id"))
+		h.WriteToken(jsontext.String(fmt.Sprintf("%x", e.OriginalDestinationConnectionID.Bytes())))
+		if e.StatelessResetToken != nil {
+			h.WriteToken(jsontext.String("stateless_reset_token"))
+			h.WriteToken(jsontext.String(fmt.Sprintf("%x", e.StatelessResetToken[:])))
+		}
+		if e.RetrySourceConnectionID.Valid() {
+			h.WriteToken(jsontext.String("retry_source_connection_id"))
+			h.WriteToken(jsontext.String(fmt.Sprintf("%x", e.RetrySourceConnectionID.Bytes())))
+		}
+	}
+	h.WriteToken(jsontext.String("initial_source_connection_id"))
+	h.WriteToken(jsontext.String(fmt.Sprintf("%x", e.InitialSourceConnectionID.Bytes())))
+	h.WriteToken(jsontext.String("disable_active_migration"))
+	h.WriteToken(jsontext.Bool(e.DisableActiveMigration))
+	if e.MaxIdleTimeout != 0 {
+		h.WriteToken(jsontext.String("max_idle_timeout"))
+		h.WriteToken(jsontext.Uint(uint64(e.MaxIdleTimeout.Milliseconds())))
+	}
+	if e.MaxUDPPayloadSize != 0 {
+		h.WriteToken(jsontext.String("max_udp_payload_size"))
+		h.WriteToken(jsontext.Int(int64(e.MaxUDPPayloadSize)))
+	}
+	h.WriteToken(jsontext.String("ack_delay_exponent"))
+	h.WriteToken(jsontext.Uint(uint64(e.AckDelayExponent)))
+	if e.MaxAckDelay != 0 {
+		h.WriteToken(jsontext.String("max_ack_delay"))
+		h.WriteToken(jsontext.Uint(uint64(e.MaxAckDelay.Milliseconds())))
+	}
+	if e.ActiveConnectionIDLimit != 0 {
+		h.WriteToken(jsontext.String("active_connection_id_limit"))
+		h.WriteToken(jsontext.Uint(e.ActiveConnectionIDLimit))
+	}
+	if e.InitialMaxData != 0 {
+		h.WriteToken(jsontext.String("initial_max_data"))
+		h.WriteToken(jsontext.Int(int64(e.InitialMaxData)))
+	}
+	if e.InitialMaxStreamDataBidiLocal != 0 {
+		h.WriteToken(jsontext.String("initial_max_stream_data_bidi_local"))
+		h.WriteToken(jsontext.Int(int64(e.InitialMaxStreamDataBidiLocal)))
+	}
+	if e.InitialMaxStreamDataBidiRemote != 0 {
+		h.WriteToken(jsontext.String("initial_max_stream_data_bidi_remote"))
+		h.WriteToken(jsontext.Int(int64(e.InitialMaxStreamDataBidiRemote)))
+	}
+	if e.InitialMaxStreamDataUni != 0 {
+		h.WriteToken(jsontext.String("initial_max_stream_data_uni"))
+		h.WriteToken(jsontext.Int(int64(e.InitialMaxStreamDataUni)))
+	}
+	if e.InitialMaxStreamsBidi != 0 {
+		h.WriteToken(jsontext.String("initial_max_streams_bidi"))
+		h.WriteToken(jsontext.Int(e.InitialMaxStreamsBidi))
+	}
+	if e.InitialMaxStreamsUni != 0 {
+		h.WriteToken(jsontext.String("initial_max_streams_uni"))
+		h.WriteToken(jsontext.Int(e.InitialMaxStreamsUni))
+	}
+	if e.PreferredAddress != nil {
+		h.WriteToken(jsontext.String("preferred_address"))
+		if err := e.PreferredAddress.encode(enc); err != nil {
+			return err
+		}
+	}
+	if e.MaxDatagramFrameSize != protocol.InvalidByteCount {
+		h.WriteToken(jsontext.String("max_datagram_frame_size"))
+		h.WriteToken(jsontext.Int(int64(e.MaxDatagramFrameSize)))
+	}
+	if e.EnableResetStreamAt {
+		h.WriteToken(jsontext.String("reset_stream_at"))
+		h.WriteToken(jsontext.True)
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+type ParametersRestored struct {
+	ActiveConnectionIDLimit        uint64
 	InitialMaxData                 protocol.ByteCount
 	InitialMaxStreamDataBidiLocal  protocol.ByteCount
 	InitialMaxStreamDataBidiRemote protocol.ByteCount
 	InitialMaxStreamDataUni        protocol.ByteCount
 	InitialMaxStreamsBidi          int64
 	InitialMaxStreamsUni           int64
-
-	PreferredAddress *preferredAddress
-
-	MaxDatagramFrameSize protocol.ByteCount
+	MaxDatagramFrameSize           protocol.ByteCount
+	EnableResetStreamAt            bool
 }
 
-func (e eventTransportParameters) Category() category { return categoryTransport }
-func (e eventTransportParameters) Name() string {
-	if e.Restore {
-		return "parameters_restored"
+func (e ParametersRestored) Name() string { return "transport:parameters_restored" }
+
+func (e ParametersRestored) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	if e.ActiveConnectionIDLimit != 0 {
+		h.WriteToken(jsontext.String("active_connection_id_limit"))
+		h.WriteToken(jsontext.Uint(e.ActiveConnectionIDLimit))
 	}
-	return "parameters_set"
-}
-func (e eventTransportParameters) IsNil() bool { return false }
-
-func (e eventTransportParameters) MarshalJSONObject(enc *gojay.Encoder) {
-	if !e.Restore {
-		enc.StringKey("owner", e.Owner.String())
-		if e.SentBy == protocol.PerspectiveServer {
-			enc.StringKey("original_destination_connection_id", connectionID(e.OriginalDestinationConnectionID).String())
-			if e.StatelessResetToken != nil {
-				enc.StringKey("stateless_reset_token", fmt.Sprintf("%x", e.StatelessResetToken[:]))
-			}
-			if e.RetrySourceConnectionID != nil {
-				enc.StringKey("retry_source_connection_id", connectionID(*e.RetrySourceConnectionID).String())
-			}
-		}
-		enc.StringKey("initial_source_connection_id", connectionID(e.InitialSourceConnectionID).String())
+	if e.InitialMaxData != 0 {
+		h.WriteToken(jsontext.String("initial_max_data"))
+		h.WriteToken(jsontext.Int(int64(e.InitialMaxData)))
 	}
-	enc.BoolKey("disable_active_migration", e.DisableActiveMigration)
-	enc.FloatKeyOmitEmpty("max_idle_timeout", milliseconds(e.MaxIdleTimeout))
-	enc.Int64KeyNullEmpty("max_udp_payload_size", int64(e.MaxUDPPayloadSize))
-	enc.Uint8KeyOmitEmpty("ack_delay_exponent", e.AckDelayExponent)
-	enc.FloatKeyOmitEmpty("max_ack_delay", milliseconds(e.MaxAckDelay))
-	enc.Uint64KeyOmitEmpty("active_connection_id_limit", e.ActiveConnectionIDLimit)
-
-	enc.Int64KeyOmitEmpty("initial_max_data", int64(e.InitialMaxData))
-	enc.Int64KeyOmitEmpty("initial_max_stream_data_bidi_local", int64(e.InitialMaxStreamDataBidiLocal))
-	enc.Int64KeyOmitEmpty("initial_max_stream_data_bidi_remote", int64(e.InitialMaxStreamDataBidiRemote))
-	enc.Int64KeyOmitEmpty("initial_max_stream_data_uni", int64(e.InitialMaxStreamDataUni))
-	enc.Int64KeyOmitEmpty("initial_max_streams_bidi", e.InitialMaxStreamsBidi)
-	enc.Int64KeyOmitEmpty("initial_max_streams_uni", e.InitialMaxStreamsUni)
-
-	if e.PreferredAddress != nil {
-		enc.ObjectKey("preferred_address", e.PreferredAddress)
+	if e.InitialMaxStreamDataBidiLocal != 0 {
+		h.WriteToken(jsontext.String("initial_max_stream_data_bidi_local"))
+		h.WriteToken(jsontext.Int(int64(e.InitialMaxStreamDataBidiLocal)))
+	}
+	if e.InitialMaxStreamDataBidiRemote != 0 {
+		h.WriteToken(jsontext.String("initial_max_stream_data_bidi_remote"))
+		h.WriteToken(jsontext.Int(int64(e.InitialMaxStreamDataBidiRemote)))
+	}
+	if e.InitialMaxStreamDataUni != 0 {
+		h.WriteToken(jsontext.String("initial_max_stream_data_uni"))
+		h.WriteToken(jsontext.Int(int64(e.InitialMaxStreamDataUni)))
+	}
+	if e.InitialMaxStreamsBidi != 0 {
+		h.WriteToken(jsontext.String("initial_max_streams_bidi"))
+		h.WriteToken(jsontext.Int(e.InitialMaxStreamsBidi))
+	}
+	if e.InitialMaxStreamsUni != 0 {
+		h.WriteToken(jsontext.String("initial_max_streams_uni"))
+		h.WriteToken(jsontext.Int(e.InitialMaxStreamsUni))
 	}
 	if e.MaxDatagramFrameSize != protocol.InvalidByteCount {
-		enc.Int64Key("max_datagram_frame_size", int64(e.MaxDatagramFrameSize))
+		h.WriteToken(jsontext.String("max_datagram_frame_size"))
+		h.WriteToken(jsontext.Int(int64(e.MaxDatagramFrameSize)))
 	}
+	if e.EnableResetStreamAt {
+		h.WriteToken(jsontext.String("reset_stream_at"))
+		h.WriteToken(jsontext.True)
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
 }
 
-type preferredAddress struct {
-	IPv4, IPv6          net.IP
-	PortV4, PortV6      uint16
+type PreferredAddress struct {
+	IPv4, IPv6          netip.AddrPort
 	ConnectionID        protocol.ConnectionID
 	StatelessResetToken protocol.StatelessResetToken
+
+	// Non-nil redacted values replace the corresponding IP and port in qlog output.
+	RedactedIPv4, RedactedIPv6 *string
 }
 
-var _ gojay.MarshalerJSONObject = &preferredAddress{}
-
-func (a preferredAddress) IsNil() bool { return false }
-func (a preferredAddress) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.StringKey("ip_v4", a.IPv4.String())
-	enc.Uint16Key("port_v4", a.PortV4)
-	enc.StringKey("ip_v6", a.IPv6.String())
-	enc.Uint16Key("port_v6", a.PortV6)
-	enc.StringKey("connection_id", connectionID(a.ConnectionID).String())
-	enc.StringKey("stateless_reset_token", fmt.Sprintf("%x", a.StatelessResetToken))
+func (a PreferredAddress) encode(enc *jsontext.Encoder) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	if a.RedactedIPv4 != nil {
+		h.WriteToken(jsontext.String("address_v4"))
+		h.WriteToken(jsontext.String(*a.RedactedIPv4))
+	} else if a.IPv4.IsValid() {
+		h.WriteToken(jsontext.String("address_v4"))
+		h.WriteIPAddressPort(a.IPv4)
+	}
+	if a.RedactedIPv6 != nil {
+		h.WriteToken(jsontext.String("address_v6"))
+		h.WriteToken(jsontext.String(*a.RedactedIPv6))
+	} else if a.IPv6.IsValid() {
+		h.WriteToken(jsontext.String("address_v6"))
+		h.WriteIPAddressPort(a.IPv6)
+	}
+	h.WriteToken(jsontext.String("connection_id"))
+	h.WriteToken(jsontext.String(fmt.Sprintf("%x", a.ConnectionID.Bytes())))
+	h.WriteToken(jsontext.String("stateless_reset_token"))
+	h.WriteToken(jsontext.String(fmt.Sprintf("%x", a.StatelessResetToken)))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
 }
 
-type eventLossTimerSet struct {
-	TimerType timerType
-	EncLevel  protocol.EncryptionLevel
-	Delta     time.Duration
+type TimerUpdated struct {
+	Type      TimerEventType
+	TimerType TimerType
+	EncLevel  EncryptionLevel
+	Time      time.Time
 }
 
-func (e eventLossTimerSet) Category() category { return categoryRecovery }
-func (e eventLossTimerSet) Name() string       { return "loss_timer_updated" }
-func (e eventLossTimerSet) IsNil() bool        { return false }
+func (e TimerUpdated) Name() string { return "recovery:loss_timer_updated" }
 
-func (e eventLossTimerSet) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.StringKey("event_type", "set")
-	enc.StringKey("timer_type", e.TimerType.String())
-	enc.StringKey("packet_number_space", encLevelToPacketNumberSpace(e.EncLevel))
-	enc.Float64Key("delta", milliseconds(e.Delta))
+func (e TimerUpdated) Encode(enc *jsontext.Encoder, t time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("event_type"))
+	h.WriteToken(jsontext.String(string(e.Type)))
+	if e.TimerType != "" {
+		h.WriteToken(jsontext.String("timer_type"))
+		h.WriteToken(jsontext.String(string(e.TimerType)))
+	}
+	if e.EncLevel != 0 {
+		h.WriteToken(jsontext.String("packet_number_space"))
+		h.WriteToken(jsontext.String(encLevelToPacketNumberSpace(e.EncLevel)))
+	}
+	if e.Type == TimerEventTypeSet {
+		h.WriteToken(jsontext.String("delta"))
+		h.WriteToken(jsontext.Float(milliseconds(e.Time.Sub(t))))
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
 }
 
-type eventLossTimerExpired struct {
-	TimerType timerType
-	EncLevel  protocol.EncryptionLevel
+type CongestionStateUpdated struct {
+	State CongestionState
 }
 
-func (e eventLossTimerExpired) Category() category { return categoryRecovery }
-func (e eventLossTimerExpired) Name() string       { return "loss_timer_updated" }
-func (e eventLossTimerExpired) IsNil() bool        { return false }
+func (e CongestionStateUpdated) Name() string { return "recovery:congestion_state_updated" }
 
-func (e eventLossTimerExpired) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.StringKey("event_type", "expired")
-	enc.StringKey("timer_type", e.TimerType.String())
-	enc.StringKey("packet_number_space", encLevelToPacketNumberSpace(e.EncLevel))
+func (e CongestionStateUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("new"))
+	h.WriteToken(jsontext.String(e.State.String()))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
 }
 
-type eventLossTimerCanceled struct{}
-
-func (e eventLossTimerCanceled) Category() category { return categoryRecovery }
-func (e eventLossTimerCanceled) Name() string       { return "loss_timer_updated" }
-func (e eventLossTimerCanceled) IsNil() bool        { return false }
-
-func (e eventLossTimerCanceled) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.StringKey("event_type", "cancelled")
+type ECNStateUpdated struct {
+	State   ECNState
+	Trigger string
 }
 
-type eventCongestionStateUpdated struct {
-	state congestionState
+func (e ECNStateUpdated) Name() string { return "recovery:ecn_state_updated" }
+
+func (e ECNStateUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("new"))
+	h.WriteToken(jsontext.String(string(e.State)))
+	if e.Trigger != "" {
+		h.WriteToken(jsontext.String("trigger"))
+		h.WriteToken(jsontext.String(e.Trigger))
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
 }
 
-func (e eventCongestionStateUpdated) Category() category { return categoryRecovery }
-func (e eventCongestionStateUpdated) Name() string       { return "congestion_state_updated" }
-func (e eventCongestionStateUpdated) IsNil() bool        { return false }
-
-func (e eventCongestionStateUpdated) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.StringKey("new", e.state.String())
+type ALPNInformation struct {
+	ChosenALPN string
 }
 
-type eventGeneric struct {
-	name string
-	msg  string
+func (e ALPNInformation) Name() string { return "transport:alpn_information" }
+
+func (e ALPNInformation) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("chosen_alpn"))
+	h.WriteToken(jsontext.BeginObject)
+	if utf8.ValidString(e.ChosenALPN) {
+		h.WriteToken(jsontext.String("string_value"))
+		h.WriteToken(jsontext.String(e.ChosenALPN))
+	} else {
+		h.WriteToken(jsontext.String("byte_value"))
+		h.WriteToken(jsontext.String(hex.EncodeToString([]byte(e.ChosenALPN))))
+	}
+	h.WriteToken(jsontext.EndObject)
+	h.WriteToken(jsontext.EndObject)
+	return h.err
 }
 
-func (e eventGeneric) Category() category { return categoryTransport }
-func (e eventGeneric) Name() string       { return e.name }
-func (e eventGeneric) IsNil() bool        { return false }
+// DebugEvent is a generic event that can be used to log arbitrary messages.
+type DebugEvent struct {
+	EventName string
+	Message   string
+}
 
-func (e eventGeneric) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.StringKey("details", e.msg)
+func (e DebugEvent) Name() string {
+	if e.EventName == "" {
+		return "transport:debug"
+	}
+	return fmt.Sprintf("transport:%s", e.EventName)
+}
+
+func (e DebugEvent) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("message"))
+	h.WriteToken(jsontext.String(e.Message))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
 }

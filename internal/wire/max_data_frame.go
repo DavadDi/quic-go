@@ -1,10 +1,8 @@
 package wire
 
 import (
-	"bytes"
-
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/quicvarint"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 // A MaxDataFrame carries flow control information for the connection
@@ -13,28 +11,23 @@ type MaxDataFrame struct {
 }
 
 // parseMaxDataFrame parses a MAX_DATA frame
-func parseMaxDataFrame(r *bytes.Reader, _ protocol.VersionNumber) (*MaxDataFrame, error) {
-	if _, err := r.ReadByte(); err != nil {
-		return nil, err
-	}
-
+func parseMaxDataFrame(b []byte, _ protocol.Version) (*MaxDataFrame, int, error) {
 	frame := &MaxDataFrame{}
-	byteOffset, err := quicvarint.Read(r)
+	byteOffset, l, err := quicvarint.Parse(b)
 	if err != nil {
-		return nil, err
+		return nil, 0, replaceUnexpectedEOF(err)
 	}
 	frame.MaximumData = protocol.ByteCount(byteOffset)
-	return frame, nil
+	return frame, l, nil
 }
 
-// Write writes a MAX_STREAM_DATA frame
-func (f *MaxDataFrame) Write(b *bytes.Buffer, version protocol.VersionNumber) error {
-	b.WriteByte(0x10)
-	quicvarint.Write(b, uint64(f.MaximumData))
-	return nil
+func (f *MaxDataFrame) Append(b []byte, _ protocol.Version) ([]byte, error) {
+	b = append(b, byte(FrameTypeMaxData))
+	b = quicvarint.Append(b, uint64(f.MaximumData))
+	return b, nil
 }
 
 // Length of a written frame
-func (f *MaxDataFrame) Length(version protocol.VersionNumber) protocol.ByteCount {
-	return 1 + quicvarint.Len(uint64(f.MaximumData))
+func (f *MaxDataFrame) Length(_ protocol.Version) protocol.ByteCount {
+	return 1 + protocol.ByteCount(quicvarint.Len(uint64(f.MaximumData)))
 }

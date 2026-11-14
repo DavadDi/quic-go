@@ -2,66 +2,68 @@ package handshake
 
 import (
 	"crypto/rand"
+	"testing"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
-type zeroReader struct{}
+func TestTokenProtectorEncodeAndDecode(t *testing.T) {
+	var key TokenProtectorKey
+	rand.Read(key[:])
+	tp := newTokenProtector(key)
 
-func (r *zeroReader) Read(b []byte) (int, error) {
-	for i := range b {
-		b[i] = 0
-	}
-	return len(b), nil
+	token, err := tp.NewToken([]byte("foobar"))
+	require.NoError(t, err)
+	require.NotContains(t, string(token), "foobar")
+
+	decoded, err := tp.DecodeToken(token)
+	require.NoError(t, err)
+	require.Equal(t, []byte("foobar"), decoded)
 }
 
-var _ = Describe("Token Protector", func() {
-	var tp tokenProtector
+func TestTokenProtectorDifferentKeys(t *testing.T) {
+	var key1, key2 TokenProtectorKey
+	rand.Read(key1[:])
+	rand.Read(key2[:])
+	tp1 := newTokenProtector(key1)
+	tp2 := newTokenProtector(key2)
 
-	BeforeEach(func() {
-		var err error
-		tp, err = newTokenProtector(rand.Reader)
-		Expect(err).ToNot(HaveOccurred())
-	})
+	t1, err := tp1.NewToken([]byte("foo"))
+	require.NoError(t, err)
+	t2, err := tp2.NewToken([]byte("foo"))
+	require.NoError(t, err)
 
-	It("uses the random source", func() {
-		tp1, err := newTokenProtector(&zeroReader{})
-		Expect(err).ToNot(HaveOccurred())
-		tp2, err := newTokenProtector(&zeroReader{})
-		Expect(err).ToNot(HaveOccurred())
-		t1, err := tp1.NewToken([]byte("foo"))
-		Expect(err).ToNot(HaveOccurred())
-		t2, err := tp2.NewToken([]byte("foo"))
-		Expect(err).ToNot(HaveOccurred())
-		Expect(t1).To(Equal(t2))
-		tp3, err := newTokenProtector(rand.Reader)
-		Expect(err).ToNot(HaveOccurred())
-		t3, err := tp3.NewToken([]byte("foo"))
-		Expect(err).ToNot(HaveOccurred())
-		Expect(t3).ToNot(Equal(t1))
-	})
+	_, err = tp1.DecodeToken(t1)
+	require.NoError(t, err)
+	_, err = tp1.DecodeToken(t2)
+	require.Error(t, err)
 
-	It("encodes and decodes tokens", func() {
-		token, err := tp.NewToken([]byte("foobar"))
-		Expect(err).ToNot(HaveOccurred())
-		Expect(token).ToNot(ContainSubstring("foobar"))
-		decoded, err := tp.DecodeToken(token)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(decoded).To(Equal([]byte("foobar")))
-	})
+	tp3 := newTokenProtector(key1)
+	_, err = tp3.DecodeToken(t1)
+	require.NoError(t, err)
+	_, err = tp3.DecodeToken(t2)
+	require.Error(t, err)
+}
 
-	It("fails deconding invalid tokens", func() {
-		token, err := tp.NewToken([]byte("foobar"))
-		Expect(err).ToNot(HaveOccurred())
-		token = token[1:] // remove the first byte
-		_, err = tp.DecodeToken(token)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("message authentication failed"))
-	})
+func TestTokenProtectorInvalidTokens(t *testing.T) {
+	var key TokenProtectorKey
+	rand.Read(key[:])
+	tp := newTokenProtector(key)
 
-	It("errors when decoding too short tokens", func() {
-		_, err := tp.DecodeToken([]byte("foobar"))
-		Expect(err).To(MatchError("token too short: 6"))
-	})
-})
+	token, err := tp.NewToken([]byte("foobar"))
+	require.NoError(t, err)
+	_, err = tp.DecodeToken(token[1:])
+	require.ErrorContains(t, err, "message authentication failed")
+}
+
+func TestTokenProtectorTooShortTokens(t *testing.T) {
+	var key TokenProtectorKey
+	rand.Read(key[:])
+	tp := newTokenProtector(key)
+
+	_, err := tp.DecodeToken([]byte("foobar"))
+	require.EqualError(t, err, "token too short: 6")
+
+	_, err = tp.DecodeToken(make([]byte, tokenSaltSize))
+	require.EqualError(t, err, "token too short: 32")
+}

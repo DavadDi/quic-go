@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -13,7 +13,7 @@ import (
 
 	"golang.org/x/net/idna"
 
-	"github.com/lucas-clemente/quic-go"
+	"github.com/quic-go/quic-go"
 )
 
 // MethodGet0RTT allows a GET request to be sent using 0-RTT.
@@ -52,7 +52,7 @@ func (r *RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		if r.TLSClientConfig != nil {
 			tlsConf = r.TLSClientConfig.Clone()
 		}
-		tlsConf.NextProtos = []string{h09alpn}
+		tlsConf.NextProtos = []string{NextProto}
 		c = &client{
 			hostname: hostname,
 			tlsConf:  tlsConf,
@@ -84,25 +84,25 @@ type client struct {
 	quicConf *quic.Config
 
 	once    sync.Once
-	sess    quic.EarlySession
+	conn    *quic.Conn
 	dialErr error
 }
 
 func (c *client) RoundTrip(req *http.Request) (*http.Response, error) {
 	c.once.Do(func() {
-		c.sess, c.dialErr = quic.DialAddrEarly(c.hostname, c.tlsConf, c.quicConf)
+		c.conn, c.dialErr = quic.DialAddrEarly(context.Background(), c.hostname, c.tlsConf, c.quicConf)
 	})
 	if c.dialErr != nil {
 		return nil, c.dialErr
 	}
 	if req.Method != MethodGet0RTT {
-		<-c.sess.HandshakeComplete().Done()
+		<-c.conn.HandshakeComplete()
 	}
 	return c.doRequest(req)
 }
 
 func (c *client) doRequest(req *http.Request) (*http.Response, error) {
-	str, err := c.sess.OpenStreamSync(context.Background())
+	str, err := c.conn.OpenStreamSync(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -118,16 +118,16 @@ func (c *client) doRequest(req *http.Request) (*http.Response, error) {
 		ProtoMajor: 0,
 		ProtoMinor: 9,
 		Request:    req,
-		Body:       ioutil.NopCloser(str),
+		Body:       io.NopCloser(str),
 	}
 	return rsp, nil
 }
 
 func (c *client) Close() error {
-	if c.sess == nil {
+	if c.conn == nil {
 		return nil
 	}
-	return c.sess.CloseWithError(0, "")
+	return c.conn.CloseWithError(0, "")
 }
 
 func hostnameFromRequest(req *http.Request) string {

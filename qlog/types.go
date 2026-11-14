@@ -2,29 +2,62 @@ package qlog
 
 import (
 	"fmt"
+	"hash/crc32"
 
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/internal/qerr"
-	"github.com/lucas-clemente/quic-go/logging"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/qerr"
 )
 
-type owner uint8
+type (
+	ConnectionID             = protocol.ConnectionID
+	ArbitraryLenConnectionID = protocol.ArbitraryLenConnectionID
+	Version                  = protocol.Version
+	PacketNumber             = protocol.PacketNumber
+	EncryptionLevel          = protocol.EncryptionLevel
+	KeyPhaseBit              = protocol.KeyPhaseBit
+	KeyPhase                 = protocol.KeyPhase
+	StreamID                 = protocol.StreamID
+	TransportErrorCode       = qerr.TransportErrorCode
+	ApplicationErrorCode     = qerr.ApplicationErrorCode
+)
 
 const (
-	ownerLocal owner = iota
-	ownerRemote
+	// KeyPhaseZero is key phase bit 0
+	KeyPhaseZero = protocol.KeyPhaseZero
+	// KeyPhaseOne is key phase bit 1
+	KeyPhaseOne = protocol.KeyPhaseOne
 )
 
-func (o owner) String() string {
-	switch o {
-	case ownerLocal:
-		return "local"
-	case ownerRemote:
-		return "remote"
-	default:
-		return "unknown owner"
-	}
-}
+// ECN represents the Explicit Congestion Notification value.
+type ECN string
+
+const (
+	// ECNUnsupported means that no ECN value was set / received
+	ECNUnsupported ECN = ""
+	// ECTNot is Not-ECT
+	ECTNot ECN = "Not-ECT"
+	// ECT0 is ECT(0)
+	ECT0 ECN = "ECT(0)"
+	// ECT1 is ECT(1)
+	ECT1 ECN = "ECT(1)"
+	// ECNCE is CE
+	ECNCE ECN = "CE"
+)
+
+type Initiator string
+
+const (
+	InitiatorLocal  Initiator = "local"
+	InitiatorRemote Initiator = "remote"
+)
+
+// Direction identifies the sending or receiving side of an endpoint.
+type Direction string
+
+const (
+	DirectionSending   Direction = "sending"
+	DirectionReceiving Direction = "receiving"
+)
 
 type streamType protocol.StreamType
 
@@ -39,44 +72,11 @@ func (s streamType) String() string {
 	}
 }
 
-type connectionID protocol.ConnectionID
+type version protocol.Version
 
-func (c connectionID) String() string {
-	return fmt.Sprintf("%x", []byte(c))
-}
-
-// category is the qlog event category.
-type category uint8
-
-const (
-	categoryConnectivity category = iota
-	categoryTransport
-	categorySecurity
-	categoryRecovery
-)
-
-func (c category) String() string {
-	switch c {
-	case categoryConnectivity:
-		return "connectivity"
-	case categoryTransport:
-		return "transport"
-	case categorySecurity:
-		return "security"
-	case categoryRecovery:
-		return "recovery"
-	default:
-		return "unknown category"
-	}
-}
-
-type versionNumber protocol.VersionNumber
-
-func (v versionNumber) String() string {
+func (v version) String() string {
 	return fmt.Sprintf("%x", uint32(v))
 }
-
-func (packetHeader) IsNil() bool { return false }
 
 func encLevelToPacketNumberSpace(encLevel protocol.EncryptionLevel) string {
 	switch encLevel {
@@ -91,95 +91,46 @@ func encLevelToPacketNumberSpace(encLevel protocol.EncryptionLevel) string {
 	}
 }
 
-type keyType uint8
+// KeyType represents the type of cryptographic key used in QUIC connections.
+type KeyType string
 
 const (
-	keyTypeServerInitial keyType = 1 + iota
-	keyTypeClientInitial
-	keyTypeServerHandshake
-	keyTypeClientHandshake
-	keyTypeServer0RTT
-	keyTypeClient0RTT
-	keyTypeServer1RTT
-	keyTypeClient1RTT
+	// KeyTypeServerInitial represents the server's initial secret key.
+	KeyTypeServerInitial KeyType = "server_initial_secret"
+	// KeyTypeClientInitial represents the client's initial secret key.
+	KeyTypeClientInitial KeyType = "client_initial_secret"
+	// KeyTypeServerHandshake represents the server's handshake secret key.
+	KeyTypeServerHandshake KeyType = "server_handshake_secret"
+	// KeyTypeClientHandshake represents the client's handshake secret key.
+	KeyTypeClientHandshake KeyType = "client_handshake_secret"
+	// KeyTypeServer0RTT represents the server's 0-RTT secret key.
+	KeyTypeServer0RTT KeyType = "server_0rtt_secret"
+	// KeyTypeClient0RTT represents the client's 0-RTT secret key.
+	KeyTypeClient0RTT KeyType = "client_0rtt_secret"
+	// KeyTypeServer1RTT represents the server's 1-RTT secret key.
+	KeyTypeServer1RTT KeyType = "server_1rtt_secret"
+	// KeyTypeClient1RTT represents the client's 1-RTT secret key.
+	KeyTypeClient1RTT KeyType = "client_1rtt_secret"
 )
 
-func encLevelToKeyType(encLevel protocol.EncryptionLevel, pers protocol.Perspective) keyType {
-	if pers == protocol.PerspectiveServer {
-		switch encLevel {
-		case protocol.EncryptionInitial:
-			return keyTypeServerInitial
-		case protocol.EncryptionHandshake:
-			return keyTypeServerHandshake
-		case protocol.Encryption0RTT:
-			return keyTypeServer0RTT
-		case protocol.Encryption1RTT:
-			return keyTypeServer1RTT
-		default:
-			return 0
-		}
-	}
-	switch encLevel {
-	case protocol.EncryptionInitial:
-		return keyTypeClientInitial
-	case protocol.EncryptionHandshake:
-		return keyTypeClientHandshake
-	case protocol.Encryption0RTT:
-		return keyTypeClient0RTT
-	case protocol.Encryption1RTT:
-		return keyTypeClient1RTT
-	default:
-		return 0
-	}
-}
-
-func (t keyType) String() string {
-	switch t {
-	case keyTypeServerInitial:
-		return "server_initial_secret"
-	case keyTypeClientInitial:
-		return "client_initial_secret"
-	case keyTypeServerHandshake:
-		return "server_handshake_secret"
-	case keyTypeClientHandshake:
-		return "client_handshake_secret"
-	case keyTypeServer0RTT:
-		return "server_0rtt_secret"
-	case keyTypeClient0RTT:
-		return "client_0rtt_secret"
-	case keyTypeServer1RTT:
-		return "server_1rtt_secret"
-	case keyTypeClient1RTT:
-		return "client_1rtt_secret"
-	default:
-		return "unknown key type"
-	}
-}
-
-type keyUpdateTrigger uint8
+// KeyUpdateTrigger describes what caused a key update event.
+type KeyUpdateTrigger string
 
 const (
-	keyUpdateTLS keyUpdateTrigger = iota
-	keyUpdateRemote
-	keyUpdateLocal
+	// KeyUpdateTLS indicates the key update was triggered by TLS.
+	KeyUpdateTLS KeyUpdateTrigger = "tls"
+	// KeyUpdateRemote indicates the key update was triggered by the remote peer.
+	KeyUpdateRemote KeyUpdateTrigger = "remote_update"
+	// KeyUpdateLocal indicates the key update was triggered locally.
+	KeyUpdateLocal KeyUpdateTrigger = "local_update"
 )
-
-func (t keyUpdateTrigger) String() string {
-	switch t {
-	case keyUpdateTLS:
-		return "tls"
-	case keyUpdateRemote:
-		return "remote_update"
-	case keyUpdateLocal:
-		return "local_update"
-	default:
-		return "unknown key update trigger"
-	}
-}
 
 type transportError uint64
 
 func (e transportError) String() string {
+	if code := qerr.TransportErrorCode(e); code.IsCryptoError() {
+		return fmt.Sprintf("crypto_error_%#x", uint16(code))
+	}
 	switch qerr.TransportErrorCode(e) {
 	case qerr.NoError:
 		return "no_error"
@@ -220,101 +171,184 @@ func (e transportError) String() string {
 	}
 }
 
-type packetType logging.PacketType
+type PacketType string
 
-func (t packetType) String() string {
-	switch logging.PacketType(t) {
-	case logging.PacketTypeInitial:
-		return "initial"
-	case logging.PacketTypeHandshake:
-		return "handshake"
-	case logging.PacketTypeRetry:
-		return "retry"
-	case logging.PacketType0RTT:
-		return "0RTT"
-	case logging.PacketTypeVersionNegotiation:
-		return "version_negotiation"
-	case logging.PacketTypeStatelessReset:
-		return "stateless_reset"
-	case logging.PacketType1RTT:
-		return "1RTT"
-	case logging.PacketTypeNotDetermined:
-		return ""
+const (
+	// PacketTypeInitial represents an Initial packet
+	PacketTypeInitial PacketType = "initial"
+	// PacketTypeHandshake represents a Handshake packet
+	PacketTypeHandshake PacketType = "handshake"
+	// PacketTypeRetry represents a Retry packet
+	PacketTypeRetry PacketType = "retry"
+	// PacketType0RTT represents a 0-RTT packet
+	PacketType0RTT PacketType = "0RTT"
+	// PacketTypeVersionNegotiation represents a Version Negotiation packet
+	PacketTypeVersionNegotiation PacketType = "version_negotiation"
+	// PacketTypeStatelessReset represents a Stateless Reset packet
+	PacketTypeStatelessReset PacketType = "stateless_reset"
+	// PacketType1RTT represents a 1-RTT packet
+	PacketType1RTT PacketType = "1RTT"
+	// PacketTypeUnknown represents a packet type that could not be determined.
+	PacketTypeUnknown PacketType = "unknown"
+)
+
+func EncryptionLevelToPacketType(l EncryptionLevel) PacketType {
+	switch l {
+	case protocol.EncryptionInitial:
+		return PacketTypeInitial
+	case protocol.EncryptionHandshake:
+		return PacketTypeHandshake
+	case protocol.Encryption0RTT:
+		return PacketType0RTT
+	case protocol.Encryption1RTT:
+		return PacketType1RTT
 	default:
-		return "unknown packet type"
+		panic(fmt.Sprintf("unknown encryption level: %d", l))
 	}
 }
 
-type packetLossReason logging.PacketLossReason
+type PacketLossReason string
 
-func (r packetLossReason) String() string {
-	switch logging.PacketLossReason(r) {
-	case logging.PacketLossReorderingThreshold:
-		return "reordering_threshold"
-	case logging.PacketLossTimeThreshold:
-		return "time_threshold"
-	default:
-		return "unknown loss reason"
-	}
-}
+const (
+	// PacketLossReorderingThreshold is used when a packet is declared lost due to reordering threshold
+	PacketLossReorderingThreshold PacketLossReason = "reordering_threshold"
+	// PacketLossTimeThreshold is used when a packet is declared lost due to time threshold
+	PacketLossTimeThreshold PacketLossReason = "time_threshold"
+)
 
-type packetDropReason logging.PacketDropReason
+type PacketDropReason string
 
-func (r packetDropReason) String() string {
-	switch logging.PacketDropReason(r) {
-	case logging.PacketDropKeyUnavailable:
-		return "key_unavailable"
-	case logging.PacketDropUnknownConnectionID:
-		return "unknown_connection_id"
-	case logging.PacketDropHeaderParseError:
-		return "header_parse_error"
-	case logging.PacketDropPayloadDecryptError:
-		return "payload_decrypt_error"
-	case logging.PacketDropProtocolViolation:
-		return "protocol_violation"
-	case logging.PacketDropDOSPrevention:
-		return "dos_prevention"
-	case logging.PacketDropUnsupportedVersion:
-		return "unsupported_version"
-	case logging.PacketDropUnexpectedPacket:
-		return "unexpected_packet"
-	case logging.PacketDropUnexpectedSourceConnectionID:
-		return "unexpected_source_connection_id"
-	case logging.PacketDropUnexpectedVersion:
-		return "unexpected_version"
-	case logging.PacketDropDuplicate:
+const (
+	// PacketDropKeysUnavailable is used when a packet is dropped because keys are unavailable
+	PacketDropKeysUnavailable PacketDropReason = "keys_unavailable"
+	// PacketDropUnknownConnectionID is used when a packet is dropped because the connection ID is unknown
+	PacketDropUnknownConnectionID PacketDropReason = "unknown_connection_id"
+	// PacketDropHeaderParseError is used when a packet is dropped because header parsing failed
+	PacketDropHeaderParseError PacketDropReason = "header_parse_error"
+	// PacketDropPayloadDecryptError is used when a packet is dropped because decrypting the payload failed
+	PacketDropPayloadDecryptError PacketDropReason = "payload_decrypt_error"
+	// PacketDropProtocolViolation is used when a packet is dropped due to a protocol violation
+	PacketDropProtocolViolation PacketDropReason = "protocol_violation"
+	// PacketDropDOSPrevention is used when a packet is dropped to mitigate a DoS attack
+	PacketDropDOSPrevention PacketDropReason = "dos_prevention"
+	// PacketDropUnsupportedVersion is used when a packet is dropped because the version is not supported
+	PacketDropUnsupportedVersion PacketDropReason = "unsupported_version"
+	// PacketDropUnexpectedPacket is used when an unexpected packet is received
+	PacketDropUnexpectedPacket PacketDropReason = "unexpected_packet"
+	// PacketDropUnexpectedSourceConnectionID is used when a packet with an unexpected source connection ID is received
+	PacketDropUnexpectedSourceConnectionID PacketDropReason = "unexpected_source_connection_id"
+	// PacketDropUnexpectedVersion is used when a packet with an unexpected version is received
+	PacketDropUnexpectedVersion PacketDropReason = "unexpected_version"
+	// PacketDropDuplicate is used when a duplicate packet is received
+	PacketDropDuplicate PacketDropReason = "duplicate"
+)
+
+// trigger returns the packet_dropped trigger defined by the qlog draft.
+func (r PacketDropReason) trigger() string {
+	switch r {
+	case PacketDropKeysUnavailable:
+		return "keys_unavailable"
+	case PacketDropUnknownConnectionID:
+		return "connection_unknown"
+	case PacketDropHeaderParseError, PacketDropProtocolViolation, PacketDropUnexpectedPacket,
+		PacketDropUnexpectedSourceConnectionID, PacketDropUnexpectedVersion:
+		return "invalid"
+	case PacketDropPayloadDecryptError:
+		return "decryption_failure"
+	case PacketDropDOSPrevention:
+		return "rejected"
+	case PacketDropUnsupportedVersion:
+		return "unsupported"
+	case PacketDropDuplicate:
 		return "duplicate"
 	default:
-		return "unknown packet drop reason"
+		return "general"
 	}
 }
 
-type timerType logging.TimerType
+type TimerEventType string
 
-func (t timerType) String() string {
-	switch logging.TimerType(t) {
-	case logging.TimerTypeACK:
-		return "ack"
-	case logging.TimerTypePTO:
-		return "pto"
-	default:
-		return "unknown timer type"
-	}
+const (
+	TimerEventTypeSet       TimerEventType = "set"
+	TimerEventTypeExpired   TimerEventType = "expired"
+	TimerEventTypeCancelled TimerEventType = "cancelled"
+)
+
+type TimerType string
+
+const (
+	// TimerTypeACK represents an ACK timer
+	TimerTypeACK TimerType = "ack"
+	// TimerTypePTO represents a PTO (Probe Timeout) timer
+	TimerTypePTO TimerType = "pto"
+	// TimerTypePathProbe represents a path probe timer
+	TimerTypePathProbe TimerType = "path_probe"
+)
+
+type ConnectionState string
+
+const (
+	// ConnectionStateAttempted means that an Initial packet was sent or received
+	ConnectionStateAttempted ConnectionState = "attempted"
+	// ConnectionStateHandshakeStarted means that the Handshake keys are available
+	ConnectionStateHandshakeStarted ConnectionState = "handshake_started"
+	// ConnectionStateHandshakeComplete means that the TLS handshake completed
+	ConnectionStateHandshakeComplete ConnectionState = "handshake_complete"
+	// ConnectionStateHandshakeConfirmed means that the handshake was confirmed
+	ConnectionStateHandshakeConfirmed ConnectionState = "handshake_confirmed"
+	// ConnectionStateClosed means that the connection was closed
+	ConnectionStateClosed ConnectionState = "closed"
+)
+
+type CongestionState string
+
+const (
+	// CongestionStateSlowStart is the slow start phase of Reno / Cubic
+	CongestionStateSlowStart CongestionState = "slow_start"
+	// CongestionStateCongestionAvoidance is the congestion avoidance phase of Reno / Cubic
+	CongestionStateCongestionAvoidance CongestionState = "congestion_avoidance"
+	// CongestionStateRecovery is the recovery phase of Reno / Cubic
+	CongestionStateRecovery CongestionState = "recovery"
+	// CongestionStateApplicationLimited means that the congestion controller is application limited
+	CongestionStateApplicationLimited CongestionState = "application_limited"
+)
+
+func (s CongestionState) String() string {
+	return string(s)
 }
 
-type congestionState logging.CongestionState
+// ECNState is the state of the ECN state machine (see Appendix A.4 of RFC 9000)
+type ECNState string
 
-func (s congestionState) String() string {
-	switch logging.CongestionState(s) {
-	case logging.CongestionStateSlowStart:
-		return "slow_start"
-	case logging.CongestionStateCongestionAvoidance:
-		return "congestion_avoidance"
-	case logging.CongestionStateRecovery:
-		return "recovery"
-	case logging.CongestionStateApplicationLimited:
-		return "application_limited"
-	default:
-		return "unknown congestion state"
-	}
+const (
+	// ECNStateTesting is the testing state
+	ECNStateTesting ECNState = "testing"
+	// ECNStateUnknown is the unknown state
+	ECNStateUnknown ECNState = "unknown"
+	// ECNStateFailed is the failed state
+	ECNStateFailed ECNState = "failed"
+	// ECNStateCapable is the capable state
+	ECNStateCapable ECNState = "capable"
+)
+
+type ConnectionCloseTrigger string
+
+const (
+	// IdleTimeout indicates the connection was closed due to idle timeout
+	ConnectionCloseTriggerIdleTimeout ConnectionCloseTrigger = "idle_timeout"
+	// Application indicates the connection was closed by the application
+	ConnectionCloseTriggerApplication ConnectionCloseTrigger = "application"
+	// VersionMismatch indicates the connection was closed due to a QUIC version mismatch
+	ConnectionCloseTriggerVersionMismatch ConnectionCloseTrigger = "version_mismatch"
+	// StatelessReset indicates the connection was closed due to receiving a stateless reset from the peer
+	ConnectionCloseTriggerStatelessReset ConnectionCloseTrigger = "stateless_reset"
+)
+
+// DatagramPayloadChecksum is the CRC32c checksum of a UDP datagram payload.
+// ponytail: zero means absent; use an optional value if zero-valued checksums need to be logged.
+type DatagramPayloadChecksum uint32
+
+// CalculateDatagramPayloadChecksum computes the checksum of a UDP datagram payload.
+func CalculateDatagramPayloadChecksum(payload []byte) DatagramPayloadChecksum {
+	return DatagramPayloadChecksum(crc32.Checksum(payload, crc32.MakeTable(crc32.Castagnoli)))
 }

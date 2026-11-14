@@ -1,13 +1,13 @@
 package handshake
 
 import (
+	"bytes"
 	"encoding/asn1"
 	"fmt"
-	"io"
 	"net"
 	"time"
 
-	"github.com/lucas-clemente/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/protocol"
 )
 
 const (
@@ -17,12 +17,19 @@ const (
 
 // A Token is derived from the client address and can be used to verify the ownership of this address.
 type Token struct {
-	IsRetryToken bool
-	RemoteAddr   string
-	SentTime     time.Time
+	IsRetryToken      bool
+	SentTime          time.Time
+	encodedRemoteAddr []byte
+	// only set for tokens sent in NEW_TOKEN frames
+	RTT time.Duration
 	// only set for retry tokens
 	OriginalDestConnectionID protocol.ConnectionID
 	RetrySrcConnectionID     protocol.ConnectionID
+}
+
+// ValidateRemoteAddr validates the address, but does not check expiration
+func (t *Token) ValidateRemoteAddr(addr net.Addr) bool {
+	return bytes.Equal(encodeRemoteAddr(addr), t.encodedRemoteAddr)
 }
 
 // token is the struct that is used for ASN1 serialization and deserialization
@@ -30,6 +37,7 @@ type token struct {
 	IsRetryToken             bool
 	RemoteAddr               []byte
 	Timestamp                int64
+	RTT                      int64 // in mus
 	OriginalDestConnectionID []byte
 	RetrySrcConnectionID     []byte
 }
@@ -39,15 +47,9 @@ type TokenGenerator struct {
 	tokenProtector tokenProtector
 }
 
-// NewTokenGenerator initializes a new TookenGenerator
-func NewTokenGenerator(rand io.Reader) (*TokenGenerator, error) {
-	tokenProtector, err := newTokenProtector(rand)
-	if err != nil {
-		return nil, err
-	}
-	return &TokenGenerator{
-		tokenProtector: tokenProtector,
-	}, nil
+// NewTokenGenerator initializes a new TokenGenerator
+func NewTokenGenerator(key TokenProtectorKey) *TokenGenerator {
+	return &TokenGenerator{tokenProtector: *newTokenProtector(key)}
 }
 
 // NewRetryToken generates a new token for a Retry for a given source address
@@ -59,8 +61,8 @@ func (g *TokenGenerator) NewRetryToken(
 	data, err := asn1.Marshal(token{
 		IsRetryToken:             true,
 		RemoteAddr:               encodeRemoteAddr(raddr),
-		OriginalDestConnectionID: origDestConnID,
-		RetrySrcConnectionID:     retrySrcConnID,
+		OriginalDestConnectionID: origDestConnID.Bytes(),
+		RetrySrcConnectionID:     retrySrcConnID.Bytes(),
 		Timestamp:                time.Now().UnixNano(),
 	})
 	if err != nil {
@@ -70,10 +72,11 @@ func (g *TokenGenerator) NewRetryToken(
 }
 
 // NewToken generates a new token to be sent in a NEW_TOKEN frame
-func (g *TokenGenerator) NewToken(raddr net.Addr) ([]byte, error) {
+func (g *TokenGenerator) NewToken(raddr net.Addr, rtt time.Duration) ([]byte, error) {
 	data, err := asn1.Marshal(token{
 		RemoteAddr: encodeRemoteAddr(raddr),
 		Timestamp:  time.Now().UnixNano(),
+		RTT:        rtt.Microseconds(),
 	})
 	if err != nil {
 		return nil, err
@@ -101,13 +104,15 @@ func (g *TokenGenerator) DecodeToken(encrypted []byte) (*Token, error) {
 		return nil, fmt.Errorf("rest when unpacking token: %d", len(rest))
 	}
 	token := &Token{
-		IsRetryToken: t.IsRetryToken,
-		RemoteAddr:   decodeRemoteAddr(t.RemoteAddr),
-		SentTime:     time.Unix(0, t.Timestamp),
+		IsRetryToken:      t.IsRetryToken,
+		SentTime:          time.Unix(0, t.Timestamp),
+		encodedRemoteAddr: t.RemoteAddr,
 	}
 	if t.IsRetryToken {
-		token.OriginalDestConnectionID = protocol.ConnectionID(t.OriginalDestConnectionID)
-		token.RetrySrcConnectionID = protocol.ConnectionID(t.RetrySrcConnectionID)
+		token.OriginalDestConnectionID = protocol.ParseConnectionID(t.OriginalDestConnectionID)
+		token.RetrySrcConnectionID = protocol.ParseConnectionID(t.RetrySrcConnectionID)
+	} else {
+		token.RTT = time.Duration(t.RTT) * time.Microsecond
 	}
 	return token, nil
 }
@@ -118,17 +123,4 @@ func encodeRemoteAddr(remoteAddr net.Addr) []byte {
 		return append([]byte{tokenPrefixIP}, udpAddr.IP...)
 	}
 	return append([]byte{tokenPrefixString}, []byte(remoteAddr.String())...)
-}
-
-// decodeRemoteAddr decodes the remote address saved in the token
-func decodeRemoteAddr(data []byte) string {
-	// data will never be empty for a token that we generated.
-	// Check it to be on the safe side
-	if len(data) == 0 {
-		return ""
-	}
-	if data[0] == tokenPrefixIP {
-		return net.IP(data[1:]).String()
-	}
-	return string(data[1:])
 }
